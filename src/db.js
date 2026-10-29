@@ -48,6 +48,7 @@ function initSchema(db) {
       plan          TEXT NOT NULL,                 -- solo | agence
       sites         INTEGER NOT NULL DEFAULT 1,
       domain        TEXT NOT NULL,                 -- host normalisé, ou '*'
+      domain_raw    TEXT,                          -- saisie brute du client
       expires_at    TEXT NOT NULL,                 -- YYYY-MM-DD
       status        TEXT NOT NULL DEFAULT 'active',-- active | revoked | refunded
       provider      TEXT NOT NULL,                 -- polar | paddle | manual
@@ -113,6 +114,9 @@ function initSchema(db) {
     db.exec('ALTER TABLE licenses ADD COLUMN mail_last_error TEXT;');
   } catch {}
   try {
+    db.exec('ALTER TABLE licenses ADD COLUMN domain_raw TEXT;');
+  } catch {}
+  try {
     db.exec("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'received';");
   } catch {}
   try {
@@ -145,8 +149,8 @@ function createLicense(data, customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`
     INSERT INTO licenses (
-      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, auto_renew, created_at, signed_key, emailed_at, mail_attempts, mail_last_error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, email, plan, sites, domain, domain_raw, expires_at, status, provider, provider_ref, auto_renew, created_at, signed_key, emailed_at, mail_attempts, mail_last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     data.id,
@@ -154,6 +158,7 @@ function createLicense(data, customDb = null) {
     data.plan || 'solo',
     data.sites || 1,
     data.domain,
+    data.domain_raw || null,
     data.expires_at,
     data.status || 'active',
     data.provider || 'manual',
@@ -272,7 +277,8 @@ function getLicenseStats(customDb = null) {
   const activations = db.prepare('SELECT COUNT(*) as count FROM activations').get()?.count || 0;
   const emails_pending = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE emailed_at IS NULL AND mail_attempts = 0").get()?.count || 0;
   const emails_failed = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE emailed_at IS NULL AND mail_attempts > 0").get()?.count || 0;
-  return { total, active, revoked, activations, emails_pending, emails_failed };
+  const events_failed = db.prepare("SELECT COUNT(*) as count FROM events WHERE status = 'failed'").get()?.count || 0;
+  return { total, active, revoked, activations, emails_pending, emails_failed, events_failed };
 }
 
 function deleteLicense(id, customDb = null) {

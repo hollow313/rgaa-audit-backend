@@ -336,6 +336,10 @@
         <div class="value" id="stat-emails-failed" style="color: #ef4444;">0</div>
       </div>
       <div class="stat-card">
+        <h3>Commandes en Échec</h3>
+        <div class="value" id="stat-events-failed" style="color: #f97316;">0</div>
+      </div>
+      <div class="stat-card">
         <h3>Alertes Partage</h3>
         <div class="value" id="stat-shared" style="color: var(--warning);">-</div>
       </div>
@@ -704,6 +708,8 @@
         document.getElementById('shared-count').textContent = shared.length || 0;
         const failedEl = document.getElementById('stat-emails-failed');
         if (failedEl) failedEl.textContent = stats.emails_failed || 0;
+        const failedEventsEl = document.getElementById('stat-events-failed');
+        if (failedEventsEl) failedEventsEl.textContent = stats.events_failed || 0;
 
         renderLicenses(allLicenses);
         renderShared(shared);
@@ -742,10 +748,15 @@
           }
         }
 
+        let domainDisplay = `<strong>${escapeHtml(lic.domain)}</strong>`;
+        if (lic.domain_raw && lic.domain_raw !== lic.domain) {
+          domainDisplay += `<div style="font-size:0.75rem; color:var(--text-muted);" title="Saisi au paiement">Saisi : ${escapeHtml(lic.domain_raw)}</div>`;
+        }
+
         let mainRow = `
           <tr>
             <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
-            <td><strong>${escapeHtml(lic.domain)}</strong></td>
+            <td>${domainDisplay}</td>
             <td><span class="badge badge-warning">${escapeHtml(lic.plan)}</span></td>
             <td>${escapeHtml(lic.email)}</td>
             <td>${escapeHtml(lic.expires_at)}</td>

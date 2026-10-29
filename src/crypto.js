@@ -16,15 +16,15 @@ function normalizeDomain(rawDomain) {
   if (!rawDomain) return '';
   let str = String(rawDomain).trim().toLowerCase();
   if (str === '*') return '*';
-  // Remove protocol
-  str = str.replace(/^[a-z]+:\/\//i, '');
+  // Remove protocol (including protocol-relative //)
+  str = str.replace(/^(?:[a-z]+:)?\/\//i, '');
   // Remove path, query string, hash
   str = str.split('/')[0].split('?')[0].split('#')[0];
   // Remove port
   str = str.split(':')[0];
   // Remove leading www.
   str = str.replace(/^www\./i, '');
-  return str;
+  return str.trim();
 }
 
 function ensureKeysDirectory() {

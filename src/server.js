@@ -409,6 +409,7 @@ app.post('/api/licenses', (req, res) => {
       plan: payload.plan,
       sites: sitesCount,
       domain: normalizedDomain,
+      domain_raw: domain,
       expires_at: expires,
       provider: 'web',
       status: 'active',
@@ -1221,7 +1222,27 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         }
       }
       const { plan, sites } = mapped;
-      const domain = data.domain || '*';
+
+      // Extract client domain from Polar custom fields (M-05)
+      let rawDomain = '';
+      if (data?.custom_field_data && typeof data.custom_field_data === 'object') {
+        rawDomain = data.custom_field_data.domain || '';
+      }
+      if (!rawDomain && Array.isArray(data?.custom_fields)) {
+        const f = data.custom_fields.find(c => c.slug === 'domain' || c.name === 'domain' || c.id === '034b493d-ad22-4d9c-8274-3e2537726617');
+        if (f && f.value) rawDomain = f.value;
+      }
+      if (!rawDomain && typeof data?.domain === 'string') {
+        rawDomain = data.domain;
+      }
+
+      const domain = rawDomain ? normalizeDomain(rawDomain) : '';
+
+      // Section 4.2: Refuser une commande Polar sans domaine exploitable (422, pas 500)
+      if (!domain || domain === '*') {
+        db.markEventFailed(eventId, 'missing_domain');
+        return res.status(422).json({ error: 'missing_domain' });
+      }
 
       let expires = null;
       if (data.subscription?.current_period_end || data.current_period_end) {
@@ -1236,26 +1257,26 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
 
       const licenseId = crypto.randomUUID();
       const nowIso = new Date().toISOString();
-      const normalizedDomain = normalizeDomain(domain);
 
-      // Sign key
+      // Sign key with normalized domain
       const payload = {
         id: licenseId,
         plan,
         sites,
         expires,
-        domain: normalizedDomain,
+        domain,
         issued_at: nowIso
       };
       const signed = signLicense(payload);
 
-      // Transactional insertion: INSERT first (emailed_at = null, mail_attempts = 0)
+      // Transactional insertion: INSERT first (domain_raw recorded for diagnostics)
       db.createLicense({
         id: licenseId,
         email,
         plan,
         sites,
-        domain: normalizedDomain,
+        domain,
+        domain_raw: rawDomain,
         expires_at: expires,
         provider: 'polar',
         provider_ref: providerRef,

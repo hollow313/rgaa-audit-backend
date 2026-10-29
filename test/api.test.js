@@ -767,7 +767,10 @@ describe('API Endpoints', () => {
       data: {
         product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7', // Valid Solo product
         customer: { email: 'retry-buyer@example.com' },
-        order_id: 'ord_retry_' + Date.now()
+        order_id: 'ord_retry_' + Date.now(),
+        custom_field_data: {
+          domain: 'retry-buyer.org'
+        }
       }
     };
     const retryHeaders = makeWebhookHeaders('polar', retryPayload, config.polarWebhookSecret);
@@ -1745,5 +1748,270 @@ describe('API Endpoints', () => {
     assert.ok(capturedEmail);
     assert.ok(capturedEmail.text.includes('/v1/download/0.2.4.zip?key='));
     assert.ok(capturedEmail.html.includes('Télécharger la version 0.2.4 (.zip)'));
+  });
+
+  /* ----------------------------------------------------
+     M-05: Sign license key with customer domain
+  ---------------------------------------------------- */
+  it('M-05 (Critère 1): order.paid without domain returns 422 missing_domain, no license created, event marked failed, replay returns 422', async () => {
+    app.resetRateLimits();
+    const eventId = 'evt_m05_nodomain_' + Date.now();
+    const orderId = 'ord_m05_nodomain_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        id: orderId,
+        billing_reason: 'purchase',
+        customer: { email: 'client-nodomain@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7'
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res1 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res1.status, 422);
+    const b1 = await res1.json();
+    assert.equal(b1.error, 'missing_domain');
+
+    // No license created
+    const lic = db.getLicenseByProviderRef('polar', orderId);
+    assert.ok(!lic, 'No license should be created');
+
+    // Event marked failed
+    const ev = db.getEvent(eventId);
+    assert.equal(ev.status, 'failed');
+    assert.equal(ev.last_error, 'missing_domain');
+
+    // Replay of same webhook-id returns 422 again, not already_processed
+    const res2 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res2.status, 422);
+    const b2 = await res2.json();
+    assert.equal(b2.error, 'missing_domain');
+  });
+
+  let savedKeyM05 = null;
+  let savedOrderIdM05 = null;
+
+  it('M-05 (Critères 2, 8, 9, 10): custom_field_data.domain Mon-Site.FR signs normalized mon-site.fr, stores domain_raw, validates domain on WP activate and updates', async () => {
+    app.resetRateLimits();
+    const eventId = 'evt_m05_c2_' + Date.now();
+    savedOrderIdM05 = 'ord_m05_c2_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        id: savedOrderIdM05,
+        billing_reason: 'purchase',
+        customer: { email: 'client-c2@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        custom_field_data: { domain: 'Mon-Site.FR' }
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'license_issued');
+    savedKeyM05 = body.key;
+
+    // Check payload of signed key
+    const verification = verifyLicenseKey(savedKeyM05);
+    assert.equal(verification.valid, true);
+    assert.equal(verification.payload.domain, 'mon-site.fr');
+
+    // Check database record
+    const lic = db.getLicenseById(body.id);
+    assert.ok(lic);
+    assert.equal(lic.domain, 'mon-site.fr');
+    assert.equal(lic.domain_raw, 'Mon-Site.FR');
+
+    // Critère 8: activate on mismatched domain (autre-site.fr) -> 409 domain_mismatch
+    const actBad = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: savedKeyM05, domain: 'autre-site.fr' })
+    });
+    assert.equal(actBad.status, 409);
+    const badBody = await actBad.json();
+    assert.equal(badBody.error, 'domain_mismatch');
+
+    // Critère 9: activate on mon-site.fr -> 200 valid
+    const actGood = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: savedKeyM05, domain: 'mon-site.fr' })
+    });
+    assert.equal(actGood.status, 200);
+    const goodBody = await actGood.json();
+    assert.equal(goodBody.valid, true);
+
+    // Critère 10: GET /v1/updates with this key returns 200
+    const updRes = await fetch(`${baseUrl}/v1/updates/rgaa-audit?key=${encodeURIComponent(savedKeyM05)}`);
+    assert.equal(updRes.status, 200);
+  });
+
+  it('M-05 (Critère 3): custom_field_data.domain "https://www.mon-site.fr/contact" normalizes to mon-site.fr', async () => {
+    app.resetRateLimits();
+    const eventId = 'evt_m05_c3_' + Date.now();
+    const orderId = 'ord_m05_c3_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        id: orderId,
+        billing_reason: 'purchase',
+        customer: { email: 'client-c3@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        custom_field_data: { domain: 'https://www.mon-site.fr/contact' }
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    const verification = verifyLicenseKey(body.key);
+    assert.equal(verification.payload.domain, 'mon-site.fr');
+    const lic = db.getLicenseById(body.id);
+    assert.equal(lic.domain, 'mon-site.fr');
+    assert.equal(lic.domain_raw, 'https://www.mon-site.fr/contact');
+  });
+
+  it('M-05 (Critère 4): custom_field_data.domain with spaces " mon-site.fr " normalizes to mon-site.fr', async () => {
+    app.resetRateLimits();
+    const eventId = 'evt_m05_c4_' + Date.now();
+    const orderId = 'ord_m05_c4_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        id: orderId,
+        billing_reason: 'purchase',
+        customer: { email: 'client-c4@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        custom_field_data: { domain: ' mon-site.fr ' }
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    const verification = verifyLicenseKey(body.key);
+    assert.equal(verification.payload.domain, 'mon-site.fr');
+  });
+
+  it('M-05 (Critère 5): custom_field_data.domain "" or "   " or "*" rejects with 422 missing_domain', async () => {
+    app.resetRateLimits();
+    const payload1 = {
+      id: 'evt_m05_empty_' + Date.now(),
+      type: 'order.paid',
+      data: {
+        id: 'ord_m05_empty_' + Date.now(),
+        customer: { email: 'client-empty@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        custom_field_data: { domain: '   ' }
+      }
+    };
+    const res1 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: makeWebhookHeaders('polar', payload1, config.polarWebhookSecret),
+      body: JSON.stringify(payload1)
+    });
+    assert.equal(res1.status, 422);
+    const b1 = await res1.json();
+    assert.equal(b1.error, 'missing_domain');
+
+    app.resetRateLimits();
+    const payload2 = {
+      id: 'evt_m05_star_' + Date.now(),
+      type: 'order.paid',
+      data: {
+        id: 'ord_m05_star_' + Date.now(),
+        customer: { email: 'client-star@test.org' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        custom_field_data: { domain: '*' }
+      }
+    };
+    const res2 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: makeWebhookHeaders('polar', payload2, config.polarWebhookSecret),
+      body: JSON.stringify(payload2)
+    });
+    assert.equal(res2.status, 422);
+    const b2 = await res2.json();
+    assert.equal(b2.error, 'missing_domain');
+  });
+
+  it('M-05 (Critère 6): POST /api/licenses with domain: "*" issues key with "*" (manual issuance preserved)', async () => {
+    app.resetRateLimits();
+    const res = await fetch(`${baseUrl}/api/licenses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: JSON.stringify({
+        email: 'manual-star@test.org',
+        plan: 'agence',
+        sites: 10,
+        domain: '*',
+        expires: '2029-12-31'
+      })
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    const verification = verifyLicenseKey(body.key);
+    assert.equal(verification.payload.domain, '*');
+    assert.equal(body.license.domain, '*');
+  });
+
+  it('M-05 (Critère 7): subscription.cycled on mon-site.fr license keeps domain unchanged', async () => {
+    app.resetRateLimits();
+    assert.ok(savedOrderIdM05, 'savedOrderIdM05 from critère 2 must exist');
+    const renewalPayload = {
+      id: 'evt_renew_m05_' + Date.now(),
+      type: 'subscription.cycled',
+      data: {
+        id: savedOrderIdM05,
+        current_period_end: '2031-10-29T00:00:00Z'
+      }
+    };
+    const headers = makeWebhookHeaders('polar', renewalPayload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(renewalPayload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'license_renewed');
+    const verification = verifyLicenseKey(body.key);
+    assert.equal(verification.payload.domain, 'mon-site.fr');
+    assert.equal(body.expires, '2031-10-29');
+
+    // DB verification
+    const lic = db.getLicenseById(body.id);
+    assert.equal(lic.domain, 'mon-site.fr');
+    assert.equal(lic.domain_raw, 'Mon-Site.FR');
   });
 });
