@@ -424,6 +424,26 @@ app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
     if (!verification.valid) {
       return res.status(403).json({ error: 'invalid_license' });
     }
+
+    const payload = verification.payload || {};
+    // Check expiration date
+    if (payload.expires) {
+      const expDate = new Date(payload.expires);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (!isNaN(expDate.getTime()) && expDate < today) {
+        return res.status(403).json({ error: 'license_expired' });
+      }
+    }
+
+    // Check revocation in DB if ID exists
+    const licenseId = payload.license_id || payload.id;
+    if (licenseId) {
+      const licDb = db.getLicenseById(licenseId);
+      if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
+        return res.status(403).json({ error: 'license_revoked' });
+      }
+    }
   }
 
   const release = db.getLatestRelease();
@@ -468,6 +488,26 @@ app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
     return res.status(403).json({ error: 'invalid_license' });
   }
 
+  const payload = verification.payload || {};
+  // Check expiration date
+  if (payload.expires) {
+    const expDate = new Date(payload.expires);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (!isNaN(expDate.getTime()) && expDate < today) {
+      return res.status(403).json({ error: 'license_expired' });
+    }
+  }
+
+  // Check revocation in DB if ID exists
+  const licenseId = payload.license_id || payload.id;
+  if (licenseId) {
+    const licDb = db.getLicenseById(licenseId);
+    if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
+      return res.status(403).json({ error: 'license_revoked' });
+    }
+  }
+
   const release = db.getRelease(version);
   if (!release || !fs.existsSync(release.zip_path)) {
     return res.status(404).json({ error: 'release_not_found' });
@@ -479,73 +519,121 @@ app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
 });
 
 /* ----------------------------------------------------
-   Webhooks Polar & Paddle (U-01)
+   Webhooks Polar & Paddle (P0 & U-01)
 ---------------------------------------------------- */
 
-function verifyPolarHmac(req, secret) {
-  if (!secret) return true; // dev/test mode
-  const header = req.headers['polar-webhook-signature'] || req.headers['webhook-signature'];
-  if (!header) return false;
+function requireWebhookHmac(provider) {
+  return (req, res, next) => {
+    const secret = provider === 'polar' ? config.polarWebhookSecret : config.paddleWebhookSecret;
+    if (!secret) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Webhook secret is not configured' });
+    }
 
-  const parts = header.split(',');
-  const tPart = parts.find(p => p.startsWith('t='));
-  const v1Part = parts.find(p => p.startsWith('v1='));
-  if (!tPart || !v1Part) return false;
+    let timestamp = null;
+    const signatureCandidates = [];
 
-  const timestamp = parseInt(tPart.slice(2), 10);
-  const sig = v1Part.slice(3);
+    // Paddle signature header: ts=12345;h1=abcd
+    const hPaddleSig = req.headers['paddle-signature'];
+    if (hPaddleSig) {
+      const parts = hPaddleSig.split(';');
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed.startsWith('ts=')) {
+          timestamp = parseInt(trimmed.slice(3), 10);
+        } else if (trimmed.startsWith('h1=') || trimmed.startsWith('v1=')) {
+          signatureCandidates.push(trimmed.slice(3));
+        }
+      }
+    }
 
-  // Reject if older than 5 minutes (300 seconds)
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - timestamp) > 300) return false;
+    // Polar / Standard Webhook headers
+    const hWebhookTimestamp = req.headers['webhook-timestamp'] || req.headers['x-webhook-timestamp'];
+    if (hWebhookTimestamp) {
+      const parsed = parseInt(hWebhookTimestamp, 10);
+      if (!isNaN(parsed)) {
+        timestamp = parsed;
+      }
+    }
 
-  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body));
-  const expected = crypto.createHmac('sha256', secret)
-    .update(`${timestamp}.${raw}`)
-    .digest('hex');
+    const hWebhookSig = req.headers['webhook-signature'] || req.headers['polar-webhook-signature'];
+    if (hWebhookSig) {
+      const entries = hWebhookSig.split(/[,;\s]+/);
+      for (const entry of entries) {
+        const trimmed = entry.trim();
+        if (!trimmed) continue;
+        if (trimmed.startsWith('t=')) {
+          if (!timestamp) {
+            timestamp = parseInt(trimmed.slice(2), 10);
+          }
+        } else if (trimmed.startsWith('v1=') || trimmed.startsWith('h1=')) {
+          signatureCandidates.push(trimmed.slice(3));
+        } else if (trimmed.startsWith('v1,')) {
+          signatureCandidates.push(trimmed.slice(3));
+        } else {
+          signatureCandidates.push(trimmed);
+        }
+      }
+    }
 
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
-  } catch {
-    return false;
-  }
-}
+    // 1. Missing headers -> 401
+    if (!timestamp || isNaN(timestamp) || signatureCandidates.length === 0) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Missing webhook signature or timestamp headers' });
+    }
 
-function verifyPaddleHmac(req, secret) {
-  if (!secret) return true;
-  const header = req.headers['paddle-signature'];
-  if (!header) return false;
+    // 2. Reject if |now - timestamp| > 300 s
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - timestamp) > 300) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Webhook timestamp expired or in the future' });
+    }
 
-  const parts = header.split(';');
-  const tsPart = parts.find(p => p.startsWith('ts='));
-  const h1Part = parts.find(p => p.startsWith('h1='));
-  if (!tsPart || !h1Part) return false;
+    // 3. HMAC-SHA256 calculated on raw body bytes (req.rawBody)
+    const rawBuf = (req.rawBody && Buffer.isBuffer(req.rawBody))
+      ? req.rawBody
+      : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
 
-  const timestamp = parseInt(tsPart.slice(3), 10);
-  const hash = h1Part.slice(3);
+    const msgId = req.headers['webhook-id'];
+    const payloadPrefixes = [
+      Buffer.from(`${timestamp}.`),
+      Buffer.from(`${timestamp}:`)
+    ];
+    if (msgId) {
+      payloadPrefixes.push(Buffer.from(`${msgId}.${timestamp}.`));
+    }
 
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - timestamp) > 300) return false;
+    const validSignatures = new Set();
+    for (const prefix of payloadPrefixes) {
+      const payloadBuf = Buffer.concat([prefix, rawBuf]);
+      const hex = crypto.createHmac('sha256', secret).update(payloadBuf).digest('hex');
+      const base64 = crypto.createHmac('sha256', secret).update(payloadBuf).digest('base64');
+      validSignatures.add(hex);
+      validSignatures.add(base64);
+    }
 
-  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body));
-  const expected = crypto.createHmac('sha256', secret)
-    .update(`${timestamp}:${raw}`)
-    .digest('hex');
+    let matched = false;
+    for (const cand of signatureCandidates) {
+      for (const validSig of validSignatures) {
+        if (typeof cand === 'string' && cand.length === validSig.length) {
+          try {
+            if (crypto.timingSafeEqual(Buffer.from(cand), Buffer.from(validSig))) {
+              matched = true;
+              break;
+            }
+          } catch {}
+        }
+      }
+      if (matched) break;
+    }
 
-  try {
-    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expected, 'hex'));
-  } catch {
-    return false;
-  }
+    if (!matched) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Invalid webhook signature' });
+    }
+
+    next();
+  };
 }
 
 // Webhook Polar
-app.post('/v1/webhook/polar', async (req, res) => {
-  // HMAC check
-  if (!verifyPolarHmac(req, config.polarWebhookSecret)) {
-    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired webhook signature' });
-  }
-
+app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
   const event = req.body;
   if (!event || !event.type || !event.id) {
     return res.status(400).json({ error: 'invalid_webhook_payload' });
@@ -626,11 +714,7 @@ app.post('/v1/webhook/polar', async (req, res) => {
 });
 
 // Webhook Paddle
-app.post('/v1/webhook/paddle', async (req, res) => {
-  if (!verifyPaddleHmac(req, config.paddleWebhookSecret)) {
-    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired webhook signature' });
-  }
-
+app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) => {
   const event = req.body;
   const eventId = event?.event_id || event?.id;
   const eventType = event?.event_type || event?.type;
@@ -832,6 +916,7 @@ if (require.main === module) {
   db.getDb();
   try {
     db.purgeOldEvents(90);
+    db.revokeSecurityTestLicenses();
   } catch {}
 
   app.listen(config.port, config.host, () => {

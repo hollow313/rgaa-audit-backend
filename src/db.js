@@ -93,6 +93,18 @@ function initSchema(db) {
   } catch {
     // Column already exists
   }
+
+  // Revoke security-test licenses if present (§P0)
+  try {
+    db.prepare(`
+      UPDATE licenses
+      SET status = 'revoked', revoke_reason = 'security-test', revoked_at = datetime('now')
+      WHERE id IN ('24fcfea8-238f-4f67-8366-f11ffd673f2b', '2b263539-976d-401e-bee1-ee8451ab2f21')
+        AND status != 'revoked'
+    `).run();
+  } catch {
+    // Table might not exist yet
+  }
 }
 
 function createLicense(data, customDb = null) {
@@ -286,6 +298,18 @@ function purgeOldEvents(days = 90, customDb = null) {
   return typeof info?.changes === 'number' ? info.changes : 0;
 }
 
+function revokeSecurityTestLicenses(customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare(`
+    UPDATE licenses
+    SET status = 'revoked', revoke_reason = 'security-test', revoked_at = datetime('now')
+    WHERE id IN ('24fcfea8-238f-4f67-8366-f11ffd673f2b', '2b263539-976d-401e-bee1-ee8451ab2f21')
+      AND status != 'revoked'
+  `);
+  const info = stmt.run();
+  return typeof info?.changes === 'number' ? info.changes : 0;
+}
+
 module.exports = {
   getDb,
   initSchema,
@@ -300,6 +324,7 @@ module.exports = {
   getSharedLicenses,
   recordEvent,
   purgeOldEvents,
+  revokeSecurityTestLicenses,
   getRevokedLicenses,
   createRelease,
   getRelease,

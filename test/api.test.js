@@ -1,9 +1,30 @@
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const app = require('../src/server');
 const db = require('../src/db');
+const config = require('../src/config');
 const { signLicense, initKeypair } = require('../src/crypto');
+
+function makeWebhookHeaders(provider, payload, secret, options = {}) {
+  const timestamp = options.timestamp !== undefined ? options.timestamp : Math.floor(Date.now() / 1000);
+  const rawBody = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const delimiter = provider === 'paddle' ? ':' : '.';
+  const signString = `${timestamp}${delimiter}${rawBody}`;
+  const sig = options.badSignature ? 'deadbeef1234' : crypto.createHmac('sha256', secret).update(signString).digest('hex');
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (options.noHeaders) return headers;
+
+  if (provider === 'paddle') {
+    headers['paddle-signature'] = `ts=${timestamp};h1=${sig}`;
+  } else {
+    headers['webhook-timestamp'] = String(timestamp);
+    headers['webhook-signature'] = `v1=${sig}`;
+  }
+  return headers;
+}
 
 describe('API Endpoints', () => {
   let server;
@@ -11,6 +32,8 @@ describe('API Endpoints', () => {
   let baseUrl;
 
   before(async () => {
+    config.polarWebhookSecret = 'test_polar_secret_key_12345';
+    config.paddleWebhookSecret = 'test_paddle_secret_key_12345';
     initKeypair();
     db.getDb();
     server = http.createServer(app);
@@ -211,39 +234,181 @@ describe('API Endpoints', () => {
     assert.ok(crl.revoked.some(r => r.reason === 'chargeback'));
   });
 
-  it('POST /v1/webhook/polar handles idempotency', async () => {
-    const eventId = 'evt_' + Date.now();
+  /* ----------------------------------------------------
+     P0 Tests: Webhook HMAC security, timestamp window & idempotency
+  ---------------------------------------------------- */
+  it('P0: POST /v1/webhook/polar rejects anonymous request without signature headers with 401', async () => {
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'evt_no_sig', type: 'order.paid' })
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.equal(body.error, 'unauthorized');
+  });
+
+  it('P0: POST /v1/webhook/polar rejects invalid signature with 401', async () => {
+    const payload = { id: 'evt_bad_sig', type: 'order.paid' };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret, { badSignature: true });
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('P0: POST /v1/webhook/polar rejects expired timestamp (> 300 s) with 401', async () => {
+    const payload = { id: 'evt_expired_ts', type: 'order.paid' };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret, { timestamp: 1 });
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('P0: POST /v1/webhook/polar accepts valid signature and creates a single license', async () => {
+    const eventId = 'evt_valid_' + Date.now();
     const payload = {
       id: eventId,
       type: 'order.paid',
       data: {
         customer_email: 'buyer@test.org',
-        plan: 'agence',
-        sites: 5,
-        domain: 'agency-site.com',
-        order_id: 'ord_' + Date.now()
+        plan: 'solo',
+        sites: 1,
+        domain: 'polar-test.org',
+        order_id: 'ord_p0_' + Date.now()
       }
     };
 
-    // First request
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
     const res1 = await fetch(`${baseUrl}/v1/webhook/polar`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(payload)
     });
     assert.equal(res1.status, 200);
     const b1 = await res1.json();
     assert.equal(b1.status, 'license_issued');
+    assert.ok(b1.id);
 
-    // Second request with same event ID (replay)
+    // Replay with identical event ID
     const res2 = await fetch(`${baseUrl}/v1/webhook/polar`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(payload)
     });
     assert.equal(res2.status, 200);
     const b2 = await res2.json();
     assert.equal(b2.status, 'already_processed');
+  });
+
+  it('P0: POST /v1/webhook/paddle enforces HMAC and accepts valid signature', async () => {
+    const payload = {
+      event_id: 'pdl_evt_' + Date.now(),
+      event_type: 'transaction.completed',
+      data: {
+        customer: { email: 'paddle-user@test.org' },
+        custom_data: { plan: 'solo', sites: 1, domain: 'paddle-site.com' },
+        id: 'txn_' + Date.now()
+      }
+    };
+
+    // Anonymous should be rejected with 401
+    const resNoSig = await fetch(`${baseUrl}/v1/webhook/paddle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    assert.equal(resNoSig.status, 401);
+
+    // Valid signature should succeed with 200
+    const headers = makeWebhookHeaders('paddle', payload, config.paddleWebhookSecret);
+    const resValid = await fetch(`${baseUrl}/v1/webhook/paddle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(resValid.status, 200);
+    const bValid = await resValid.json();
+    assert.equal(bValid.status, 'license_issued');
+  });
+
+  it('P0: Security test licenses from audit recipe are revoked', () => {
+    const id1 = '24fcfea8-238f-4f67-8366-f11ffd673f2b';
+    const id2 = '2b263539-976d-401e-bee1-ee8451ab2f21';
+
+    // Even if inserted, db.revokeSecurityTestLicenses() marks them revoked
+    db.createLicense({
+      id: id1,
+      email: 'test@example.com',
+      domain: 'test.fr',
+      expires_at: '2030-01-01',
+      status: 'active'
+    });
+    db.revokeSecurityTestLicenses();
+
+    const lic1 = db.getLicenseById(id1);
+    assert.equal(lic1.status, 'revoked');
+    assert.equal(lic1.revoke_reason, 'security-test');
+  });
+
+  /* ----------------------------------------------------
+     Expiration & Revocation Policy on Updates Manifest
+  ---------------------------------------------------- */
+  it('Policy: GET /v1/updates rejects expired license with 403 license_expired', async () => {
+    const expLicenseId = 'test-exp-' + Date.now();
+    db.createLicense({
+      id: expLicenseId,
+      email: 'expired@test.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'expired.fr',
+      expires_at: '2020-01-01',
+      status: 'active'
+    });
+
+    const signed = signLicense({
+      id: expLicenseId,
+      plan: 'solo',
+      sites: 1,
+      domain: 'expired.fr',
+      expires: '2020-01-01'
+    });
+
+    const res = await fetch(`${baseUrl}/v1/updates?key=${signed.key}`);
+    assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.error, 'license_expired');
+  });
+
+  it('Policy: GET /v1/updates rejects revoked license with 403 license_revoked', async () => {
+    const revLicenseId = 'test-rev-upd-' + Date.now();
+    db.createLicense({
+      id: revLicenseId,
+      email: 'rev@test.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'rev.fr',
+      expires_at: '2029-01-01',
+      status: 'revoked'
+    });
+
+    const signed = signLicense({
+      id: revLicenseId,
+      plan: 'solo',
+      sites: 1,
+      domain: 'rev.fr',
+      expires: '2029-01-01'
+    });
+
+    const res = await fetch(`${baseUrl}/v1/updates?key=${signed.key}`);
+    assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.error, 'license_revoked');
   });
 
   /* ----------------------------------------------------

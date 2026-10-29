@@ -267,3 +267,69 @@ openssl dgst -sha256 -verify public.pem -signature /tmp/signature.bin /tmp/paylo
 - Le **`next_update` à +24 h** : c'est l'anti-rejeu du client.
 - Le **refus des domaines vides** : une clé sans domaine circulerait partout.
 - Le `404 no_release_found` quand aucune version n'est publiée.
+
+
+---
+
+# Annexe — recette du 29/10/2026 après implémentation (L1, L2, U-01, U-04, U-05)
+
+## Ce qui est validé
+
+| Point | Preuve |
+|---|---|
+| `B-01` alias `/v1/updates` | `/v1/updates` et `/v1/updates/rgaa-audit` renvoient **le même corps** (`{"error":"no_release_found"}`, `404`, `application/json`) |
+| `B-01` erreurs JSON | route inconnue → `{"error":"not_found"}` en `application/json` ; `X-Powered-By` retiré |
+| `B-02` ETag stable | deux appels consécutifs → même `ETag` (`W/"6517f78a211daacd"`) et corps identique |
+| `B-02` 304 | `If-None-Match` → **`304`**, avec `Cache-Control: public, max-age=3600` et `ETag` conservés |
+| CRL signée | `openssl dgst -sha256 -verify` → **`Verified OK`** |
+| `U-05` rate limit | 10 requêtes passent, la 11ᵉ et la 12ᵉ → **`429`** avec `Retry-After: 60` |
+| `U-01` idempotence | même `event.id` rejoué → `200 {"status":"already_processed"}`, aucune seconde licence |
+| `U-01` type inconnu | `{"status":"ignored"}` |
+| ZIP protégé | `/v1/download/0.2.0.zip` sans clé → `403` |
+
+## P0 — À CORRIGER AVANT TOUTE MISE EN VENTE
+
+### `POST /v1/webhook/polar` émet une licence **sans vérifier la signature**
+
+**CONSTAT.** L'endpoint accepte un POST anonyme et crée une licence. Ni la signature HMAC, ni
+la fenêtre de 5 minutes ne sont contrôlées sur cette route. `paddle` rejette correctement
+(`400 invalid_webhook_payload`) : le traitement n'est pas le même selon le fournisseur.
+
+**PREUVE (reproductible tel quel).**
+```
+$ curl -s -w '|%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d '{"id":"evt_test","type":"order.paid"}' http://<IP>:30019/v1/webhook/polar
+{"status":"license_issued","id":"24fcfea8-238f-4f67-8366-f11ffd673f2b"}|200
+
+$ curl -s -w '|%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H 'webhook-signature: deadbeef' -H 'webhook-timestamp: 1' \
+    -d '{"id":"evt_test_3","type":"order.paid"}' http://<IP>:30019/v1/webhook/polar
+{"status":"license_issued","id":"2b263539-976d-401e-bee1-ee8451ab2f21"}|200
+```
+Une signature bidon **et** un horodatage de 1970 passent. N'importe qui peut donc fabriquer des
+licences en boucle : c'est une perte de revenu immédiate et totale.
+
+**SPÉCIFICATION.**
+1. Sur **les deux** routes (`polar` et `paddle`), avant toute lecture du corps :
+   - exiger la présence des en-têtes de signature et d'horodatage ; absents → **`401`**, aucune écriture ;
+   - rejeter si `|now - timestamp| > 300 s` → **`401`** ;
+   - calculer le HMAC-SHA256 sur le **corps brut** (`rawBody`, pas sur le JSON re-sérialisé) et comparer avec `hash_equals()`.
+2. Factoriser ce contrôle dans **un seul middleware** appliqué aux deux routes : le fait que
+   `paddle` se comporte mieux que `polar` prouve que la logique est dupliquée.
+3. Écrire un test de non-régression : POST sans signature → `401` ; POST avec signature fausse → `401` ;
+   POST avec signature valide → `200` et une seule licence.
+4. **Purger les deux licences créées par la recette** :
+   `24fcfea8-238f-4f67-8366-f11ffd673f2b` et `2b263539-976d-401e-bee1-ee8451ab2f21`
+   (statut `revoked`, raison `security-test`), et vérifier qu'elles n'ont pas été envoyées par email.
+
+**PIÈGE.** Vérifier la signature sur le JSON **re-sérialisé** au lieu du corps brut casse dès que
+l'ordre des clés ou les espaces diffèrent : le HMAC ne correspondra jamais, et le réflexe sera de
+désactiver le contrôle « pour que ça marche ». Lire `req.rawBody` (ou un buffer équivalent).
+
+## Reste à valider côté serveur
+
+- `U-03` sauvegarde/restauration de la clé privée (pas encore testé).
+- `U-04` : la purge à 90 jours tourne-t-elle réellement (job planifié) ? et `/v1/crl` restera sans
+  email une fois une licence révoquée — à vérifier avec au moins une entrée dans `revoked`.
+- Politique d'expiration : le manifeste doit être refusé (`403`) pour une licence dont la date est
+  passée ; le client le fait déjà de son côté, le serveur doit le faire aussi.
