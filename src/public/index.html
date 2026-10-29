@@ -57,7 +57,7 @@
 
     .logo-area p { color: var(--text-muted); font-size: 0.875rem; }
 
-    .header-actions { display: flex; gap: 0.75rem; align-items: center; }
+    .header-actions { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
 
     .badge {
       display: inline-flex;
@@ -111,6 +111,8 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 0.75rem;
     }
 
     .form-grid {
@@ -156,10 +158,13 @@
     .btn-secondary { background: #334155; color: #fff; }
     .btn-secondary:hover { background: #475569; }
 
+    .btn-success { background: var(--success); color: #fff; }
+    .btn-success:hover { background: #059669; }
+
     .btn-danger { background: var(--danger); color: #fff; }
     .btn-danger:hover { background: #dc2626; }
 
-    .btn-sm { padding: 0.35rem 0.65rem; font-size: 0.75rem; }
+    .btn-sm { padding: 0.4rem 0.75rem; font-size: 0.785rem; }
 
     .table-container { overflow-x: auto; margin-top: 1rem; }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.875rem; }
@@ -173,27 +178,38 @@
       border-bottom: 1px solid var(--surface-border);
     }
     td { padding: 0.85rem 1rem; border-bottom: 1px solid var(--surface-border); }
-    tr:hover { background: rgba(255, 255, 255, 0.02); }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
 
-    .key-preview {
-      font-family: monospace;
-      font-size: 0.8rem;
+    .key-textarea {
+      width: 100%;
       background: #0f172a;
-      padding: 0.35rem 0.6rem;
-      border-radius: 0.35rem;
-      max-width: 200px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      display: inline-block;
-      vertical-align: middle;
       border: 1px solid var(--surface-border);
+      border-radius: 0.5rem;
+      padding: 0.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.8125rem;
+      color: #38bdf8;
+      line-height: 1.4;
+      resize: vertical;
+      user-select: all;
+    }
+    .key-textarea:focus {
+      border-color: var(--primary);
+      outline: none;
+    }
+
+    .expanded-key-box {
+      background: #0b1120;
+      border-left: 3px solid var(--primary);
+      padding: 1rem;
+      margin: 0.5rem 0;
+      border-radius: 0 0.5rem 0.5rem 0;
     }
 
     .modal-overlay {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.75);
+      background: rgba(0, 0, 0, 0.8);
       display: none;
       justify-content: center;
       align-items: center;
@@ -207,8 +223,10 @@
       border: 1px solid var(--surface-border);
       border-radius: 0.75rem;
       padding: 1.5rem;
-      max-width: 600px;
+      max-width: 650px;
       width: 100%;
+      max-height: 90vh;
+      overflow-y: auto;
     }
 
     .modal-header {
@@ -218,19 +236,20 @@
       margin-bottom: 1rem;
     }
 
-    .copy-box {
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.75rem;
       background: #0f172a;
-      border: 1px solid var(--surface-border);
+      padding: 0.85rem;
       border-radius: 0.5rem;
-      padding: 1rem;
-      font-family: monospace;
+      border: 1px solid var(--surface-border);
+      margin-bottom: 1rem;
       font-size: 0.8125rem;
-      word-break: break-all;
-      max-height: 200px;
-      overflow-y: auto;
-      margin: 1rem 0;
-      color: #38bdf8;
     }
+    .meta-item { display: flex; flex-direction: column; }
+    .meta-item span:first-child { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; }
+    .meta-item span:last-child { font-weight: 600; color: #fff; }
 
     .tabs {
       display: flex;
@@ -255,16 +274,22 @@
 
     .toast {
       position: fixed;
-      bottom: 1.5rem;
-      right: 1.5rem;
-      background: var(--success);
+      bottom: 2rem;
+      right: 2rem;
+      background: #10b981;
       color: #fff;
-      padding: 0.75rem 1.25rem;
+      padding: 0.85rem 1.4rem;
       border-radius: 0.5rem;
-      font-weight: 500;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      font-weight: 600;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
       display: none;
       z-index: 99;
+      animation: fadeIn 0.2s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
     }
 
     .empty-state {
@@ -280,7 +305,7 @@
       <div class="logo-area">
         <h1>
           <span>🛡️ RGAA Audit</span>
-          <span class="badge badge-success"><span class="pulse"></span> En ligne (Port 30019)</span>
+          <span class="badge badge-success"><span class="pulse"></span> Serveur en ligne (Port 30019)</span>
         </h1>
         <p>Gestionnaire de licences & mises à jour WordPress</p>
       </div>
@@ -357,8 +382,8 @@
     <!-- Table Licences -->
     <div id="tab-licenses" class="card">
       <div class="card-title">
-        <span>Liste des Licences</span>
-        <input type="text" id="search-input" placeholder="Rechercher par domaine, email..." oninput="filterLicenses()" style="width: 250px;">
+        <span>Liste des Licences Enregistrées</span>
+        <input type="text" id="search-input" placeholder="🔍 Rechercher par domaine, email..." oninput="filterLicenses()" style="width: 280px;">
       </div>
       <div class="table-container">
         <table id="licenses-table">
@@ -370,12 +395,11 @@
               <th>Email</th>
               <th>Expiration</th>
               <th>Activations</th>
-              <th>Clé signée</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="licenses-tbody">
-            <tr><td colspan="8" class="empty-state">Chargement des données...</td></tr>
+            <tr><td colspan="7" class="empty-state">Chargement des licences...</td></tr>
           </tbody>
         </table>
       </div>
@@ -407,46 +431,55 @@
   </div>
 
   <!-- Modal Affichage Clé -->
-  <div class="modal-overlay" id="key-modal">
+  <div class="modal-overlay" id="key-modal" onclick="if(event.target===this) closeModal('key-modal')">
     <div class="modal">
       <div class="modal-header">
-        <h3 id="modal-title">Clé de licence générée</h3>
+        <h3 id="modal-title">Détails de la licence</h3>
         <button class="btn-secondary btn-sm" onclick="closeModal('key-modal')">✕</button>
       </div>
-      <p style="font-size: 0.875rem; color: var(--text-muted);">
-        Copiez cette clé complète dans l'administration WordPress (<em>RGAA Audit > Réglages > Clé de licence</em>) :
+
+      <div class="meta-grid" id="modal-meta-grid"></div>
+
+      <label style="font-size:0.8125rem; font-weight:600; color:var(--text-muted); display:block; margin-bottom:0.35rem;">
+        Clé de licence complète signée (RSA-SHA256) :
+      </label>
+      <textarea id="modal-key-textarea" class="key-textarea" rows="5" readonly spellcheck="false" onclick="this.select()"></textarea>
+
+      <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">
+        💡 <em>Cliquez dans la zone ci-dessus pour tout sélectionner, ou utilisez le bouton ci-dessous pour copier en 1 clic.</em>
       </p>
-      <div class="copy-box" id="modal-key-content"></div>
-      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
-        <button class="btn-primary" onclick="copyModalKey()">📋 Copier la clé</button>
+
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.25rem;">
+        <button class="btn-primary" id="modal-copy-btn" onclick="copyFromModal()">📋 Copier la clé</button>
         <button class="btn-secondary" onclick="closeModal('key-modal')">Fermer</button>
       </div>
     </div>
   </div>
 
   <!-- Modal Clé Publique PEM -->
-  <div class="modal-overlay" id="public-key-modal">
+  <div class="modal-overlay" id="public-key-modal" onclick="if(event.target===this) closeModal('public-key-modal')">
     <div class="modal">
       <div class="modal-header">
         <h3>Clé Publique RSA (Format PEM)</h3>
         <button class="btn-secondary btn-sm" onclick="closeModal('public-key-modal')">✕</button>
       </div>
-      <p style="font-size: 0.875rem; color: var(--text-muted);">
-        À embarquer dans le plugin WordPress pour la vérification hors ligne :
+      <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+        À embarquer dans le plugin WordPress pour la vérification de signature hors ligne :
       </p>
-      <div class="copy-box" id="modal-public-key-content"></div>
-      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
-        <button class="btn-primary" onclick="copyPublicKey()">📋 Copier la clé publique</button>
+      <textarea id="modal-public-key-textarea" class="key-textarea" rows="8" readonly spellcheck="false" onclick="this.select()"></textarea>
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.25rem;">
+        <button class="btn-primary" id="modal-pubkey-copy-btn" onclick="copyPublicKeyFromModal()">📋 Copier la clé publique</button>
         <button class="btn-secondary" onclick="closeModal('public-key-modal')">Fermer</button>
       </div>
     </div>
   </div>
 
   <!-- Toast -->
-  <div class="toast" id="toast">Copié dans le presse-papier !</div>
+  <div class="toast" id="toast">✅ Clé copiée dans le presse-papier !</div>
 
   <script>
     let allLicenses = [];
+    let expandedRowId = null;
 
     // Set default expiration date to +1 year
     const nextYear = new Date();
@@ -482,7 +515,7 @@
     function renderLicenses(licenses) {
       const tbody = document.getElementById('licenses-tbody');
       if (!licenses || licenses.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Aucune licence enregistrée pour le moment.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Aucune licence enregistrée pour le moment.</td></tr>';
         return;
       }
 
@@ -491,8 +524,9 @@
         const badgeClass = isRevoked ? 'badge-danger' : 'badge-success';
         const statusLabel = isRevoked ? 'Révoquée' : 'Active';
         const activationsCount = lic.activations_count || 0;
+        const isExpanded = expandedRowId === lic.id;
 
-        return `
+        let mainRow = `
           <tr>
             <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
             <td><strong>${escapeHtml(lic.domain)}</strong></td>
@@ -501,18 +535,42 @@
             <td>${escapeHtml(lic.expires_at)}</td>
             <td>${activationsCount} site(s)</td>
             <td>
-              <span class="key-preview" title="${escapeHtml(lic.key)}">${escapeHtml(lic.key)}</span>
-              <button class="btn-secondary btn-sm" onclick="copyText('${lic.key}')">📋</button>
-            </td>
-            <td>
-              <div style="display: flex; gap: 0.4rem;">
-                <button class="btn-secondary btn-sm" onclick="viewKey('${lic.id}')">Voir</button>
-                ${!isRevoked ? `<button class="btn-danger btn-sm" onclick="handleRevoke('${lic.id}')">Révoquer</button>` : ''}
+              <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
+                <button class="btn-primary btn-sm" onclick="copyKeyById('${escapeHtml(lic.id)}', this)">📋 Copier</button>
+                <button class="btn-secondary btn-sm" onclick="toggleExpandKey('${escapeHtml(lic.id)}')">
+                  ${isExpanded ? '▲ Masquer' : '👁️ Voir la clé'}
+                </button>
+                <button class="btn-secondary btn-sm" onclick="viewKeyModal('${escapeHtml(lic.id)}')">Détails</button>
+                ${!isRevoked ? `<button class="btn-danger btn-sm" onclick="handleRevoke('${escapeHtml(lic.id)}')">Révoquer</button>` : ''}
               </div>
             </td>
           </tr>
         `;
+
+        let expandRow = '';
+        if (isExpanded) {
+          expandRow = `
+            <tr>
+              <td colspan="7" style="padding: 0.5rem 1rem 1rem 1rem; background: rgba(0,0,0,0.25);">
+                <div class="expanded-key-box">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                    <strong style="color:var(--text); font-size:0.85rem;">Clé complète pour ${escapeHtml(lic.domain)} :</strong>
+                    <button class="btn-primary btn-sm" onclick="copyKeyById('${escapeHtml(lic.id)}', this)">📋 Copier la clé</button>
+                  </div>
+                  <textarea class="key-textarea" rows="4" readonly spellcheck="false" onclick="this.select()">${escapeHtml(lic.key || '')}</textarea>
+                </div>
+              </td>
+            </tr>
+          `;
+        }
+
+        return mainRow + expandRow;
       }).join('');
+    }
+
+    function toggleExpandKey(id) {
+      expandedRowId = (expandedRowId === id) ? null : id;
+      filterLicenses();
     }
 
     function renderShared(shared) {
@@ -530,7 +588,7 @@
           <td><strong>${escapeHtml(item.licensed_domain)}</strong></td>
           <td><span style="color:var(--warning); font-weight:600;">${item.active_domains_count}</span> (${escapeHtml(item.active_domains)})</td>
           <td>
-            <button class="btn-danger btn-sm" onclick="handleRevoke('${item.id}')">Révoquer</button>
+            <button class="btn-danger btn-sm" onclick="handleRevoke('${escapeHtml(item.id)}')">Révoquer</button>
           </td>
         </tr>
       `).join('');
@@ -568,11 +626,13 @@
         }
 
         const data = await res.json();
-        document.getElementById('modal-title').textContent = 'Licence générée avec succès !';
-        document.getElementById('modal-key-content').textContent = data.key;
-        document.getElementById('key-modal').style.display = 'flex';
+        const createdLicense = data.license || {};
+        createdLicense.key = data.key;
 
-        // Reset domain and refresh list
+        // Open modal with the new key
+        showKeyDetails(createdLicense, '✨ Nouvelle licence générée avec succès !');
+
+        // Reset email and refresh list
         document.getElementById('email').value = '';
         loadData();
       } catch (err) {
@@ -580,8 +640,40 @@
       }
     }
 
+    function viewKeyModal(id) {
+      const lic = allLicenses.find(l => l.id === id);
+      if (!lic) return;
+      showKeyDetails(lic, `Détails Licence : ${lic.domain}`);
+    }
+
+    function showKeyDetails(lic, title) {
+      document.getElementById('modal-title').textContent = title;
+      
+      const isRevoked = lic.status === 'revoked' || lic.status === 'refunded';
+      const statusText = isRevoked ? '❌ Révoquée' : '✅ Active';
+
+      document.getElementById('modal-meta-grid').innerHTML = `
+        <div class="meta-item"><span>Domaine</span><span>${escapeHtml(lic.domain)}</span></div>
+        <div class="meta-item"><span>Plan</span><span>${escapeHtml(lic.plan)} (${lic.sites} site(s))</span></div>
+        <div class="meta-item"><span>Expiration</span><span>${escapeHtml(lic.expires_at || lic.expires)}</span></div>
+        <div class="meta-item"><span>Statut</span><span>${statusText}</span></div>
+        <div class="meta-item" style="grid-column: 1 / -1;"><span>Email client</span><span>${escapeHtml(lic.email)}</span></div>
+        <div class="meta-item" style="grid-column: 1 / -1;"><span>ID Licence</span><code style="font-size:0.75rem; color:#94a3b8;">${escapeHtml(lic.id)}</code></div>
+      `;
+
+      const textarea = document.getElementById('modal-key-textarea');
+      textarea.value = lic.key || '';
+      document.getElementById('key-modal').style.display = 'flex';
+
+      // Auto-select the textarea text
+      setTimeout(() => {
+        textarea.focus();
+        textarea.select();
+      }, 50);
+    }
+
     async function handleRevoke(id) {
-      const reason = prompt('Motif de la révocation (ex: refund, dispute, chargeback) :', 'refund');
+      const reason = prompt('Motif de la révocation (ex: refund, chargeback, impayé) :', 'refund');
       if (reason === null) return;
 
       try {
@@ -592,7 +684,7 @@
         });
 
         if (res.ok) {
-          showToast('Licence révoquée avec succès');
+          showToast('Licence révoquée avec succès !');
           loadData();
         } else {
           alert('Erreur lors de la révocation');
@@ -602,20 +694,17 @@
       }
     }
 
-    function viewKey(id) {
-      const lic = allLicenses.find(l => l.id === id);
-      if (!lic) return;
-      document.getElementById('modal-title').textContent = `Clé de licence (${lic.domain})`;
-      document.getElementById('modal-key-content').textContent = lic.key;
-      document.getElementById('key-modal').style.display = 'flex';
-    }
-
     async function showPublicKeyModal() {
       try {
         const res = await fetch('/v1/public-key');
         const pubKey = await res.text();
-        document.getElementById('modal-public-key-content').textContent = pubKey;
+        const textarea = document.getElementById('modal-public-key-textarea');
+        textarea.value = pubKey;
         document.getElementById('public-key-modal').style.display = 'flex';
+        setTimeout(() => {
+          textarea.focus();
+          textarea.select();
+        }, 50);
       } catch (err) {
         alert('Impossible de récupérer la clé publique: ' + err.message);
       }
@@ -625,28 +714,86 @@
       document.getElementById(modalId).style.display = 'none';
     }
 
-    function copyModalKey() {
-      const key = document.getElementById('modal-key-content').textContent;
-      copyText(key);
+    function copyKeyById(id, btnElement = null) {
+      const lic = allLicenses.find(l => l.id === id);
+      if (lic && lic.key) {
+        copyText(lic.key, btnElement);
+      }
     }
 
-    function copyPublicKey() {
-      const key = document.getElementById('modal-public-key-content').textContent;
-      copyText(key);
+    function copyFromModal() {
+      const textarea = document.getElementById('modal-key-textarea');
+      const btn = document.getElementById('modal-copy-btn');
+      copyText(textarea.value, btn);
     }
 
-    function copyText(text) {
-      navigator.clipboard.writeText(text).then(() => {
-        showToast('Copié dans le presse-papier !');
-      }).catch(() => {
-        const input = document.createElement('textarea');
-        input.value = text;
-        document.body.appendChild(input);
-        input.select();
-        document.execCommand('copy');
-        document.body.removeChild(input);
-        showToast('Copié dans le presse-papier !');
-      });
+    function copyPublicKeyFromModal() {
+      const textarea = document.getElementById('modal-public-key-textarea');
+      const btn = document.getElementById('modal-pubkey-copy-btn');
+      copyText(textarea.value, btn);
+    }
+
+    /**
+     * Universal copy function that works reliably on HTTP and HTTPS across all browsers
+     */
+    function copyText(text, btnElement = null) {
+      if (!text) return;
+
+      let copied = false;
+
+      // 1. Try modern clipboard API if in secure context
+      if (typeof window !== 'undefined' && window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          onCopySuccess(btnElement);
+        }).catch(() => {
+          fallbackCopy(text, btnElement);
+        });
+        return;
+      }
+
+      // 2. Fallback using document.execCommand('copy') which works in non-secure HTTP
+      fallbackCopy(text, btnElement);
+    }
+
+    function fallbackCopy(text, btnElement = null) {
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '0';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+        const successful = document.execCommand('copy');
+        document.body.removeChild(textarea);
+
+        if (successful) {
+          onCopySuccess(btnElement);
+        } else {
+          prompt('Copiez la clé complète ci-dessous (Ctrl+C puis Entrée) :', text);
+        }
+      } catch (err) {
+        prompt('Copiez la clé complète ci-dessous (Ctrl+C puis Entrée) :', text);
+      }
+    }
+
+    function onCopySuccess(btnElement) {
+      showToast('✅ Clé copiée dans le presse-papier !');
+      if (btnElement) {
+        const originalText = btnElement.innerHTML;
+        btnElement.innerHTML = '✅ Copié !';
+        btnElement.style.background = '#10b981';
+        btnElement.style.color = '#fff';
+        setTimeout(() => {
+          btnElement.innerHTML = originalText;
+          btnElement.style.background = '';
+          btnElement.style.color = '';
+        }, 2000);
+      }
     }
 
     function showToast(msg) {

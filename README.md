@@ -23,7 +23,7 @@ Le serveur s'exécute dans un conteneur léger **Linux Alpine**, avec un utilisa
 Ouvrez simplement l'adresse suivante dans votre navigateur :
 
 ```
-http://<IP-du-NAS-ou-serveur>:30019/
+http://<IP-du-serveur>:30019/
 ```
 
 Fonctionnalités disponibles sur l'interface :
@@ -56,7 +56,7 @@ Créez le répertoire local pour stocker les clés et attribuez les permissions 
 
 ```bash
 mkdir -p keys
-# Sur Linux / NAS :
+# Sur Linux / serveur :
 chown -R 568:568 keys
 chmod 700 keys
 ```
