@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RGAA Audit — Serveur de Licences</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --surface-border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --primary-light: #e0e7ff;
+      --success: #10b981;
+      --success-bg: rgba(16, 185, 129, 0.15);
+      --danger: #ef4444;
+      --danger-bg: rgba(239, 68, 68, 0.15);
+      --warning: #f59e0b;
+      --warning-bg: rgba(245, 158, 11, 0.15);
+      --font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.5;
+      padding: 1.5rem;
+      min-height: 100vh;
+    }
+
+    .container { max-width: 1200px; margin: 0 auto; }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--surface-border);
+      margin-bottom: 2rem;
+    }
+
+    .logo-area h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .logo-area p { color: var(--text-muted); font-size: 0.875rem; }
+
+    .header-actions { display: flex; gap: 0.75rem; align-items: center; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badge-success { background: var(--success-bg); color: var(--success); border: 1px solid rgba(16,185,129,0.3); }
+    .badge-danger { background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(239,68,68,0.3); }
+    .badge-warning { background: var(--warning-bg); color: var(--warning); border: 1px solid rgba(245,158,11,0.3); }
+
+    .pulse {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+    }
+
+    .stat-card h3 { font-size: 0.8125rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+    .stat-card .value { font-size: 2rem; font-weight: 700; margin-top: 0.25rem; color: #fff; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .card-title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      align-items: end;
+    }
+
+    .form-group { display: flex; flex-direction: column; gap: 0.35rem; }
+    .form-group label { font-size: 0.8125rem; font-weight: 500; color: var(--text-muted); }
+
+    input, select, textarea {
+      background: #0f172a;
+      border: 1px solid var(--surface-border);
+      color: #fff;
+      padding: 0.65rem 0.85rem;
+      border-radius: 0.5rem;
+      font-size: 0.875rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--primary); }
+
+    button {
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 500;
+      border-radius: 0.5rem;
+      padding: 0.65rem 1.15rem;
+      font-size: 0.875rem;
+      border: none;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+    }
+
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+
+    .btn-secondary { background: #334155; color: #fff; }
+    .btn-secondary:hover { background: #475569; }
+
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { background: #dc2626; }
+
+    .btn-sm { padding: 0.35rem 0.65rem; font-size: 0.75rem; }
+
+    .table-container { overflow-x: auto; margin-top: 1rem; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.875rem; }
+    th {
+      background: #0f172a;
+      padding: 0.75rem 1rem;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      font-weight: 600;
+      border-bottom: 1px solid var(--surface-border);
+    }
+    td { padding: 0.85rem 1rem; border-bottom: 1px solid var(--surface-border); }
+    tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+    .key-preview {
+      font-family: monospace;
+      font-size: 0.8rem;
+      background: #0f172a;
+      padding: 0.35rem 0.6rem;
+      border-radius: 0.35rem;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: inline-block;
+      vertical-align: middle;
+      border: 1px solid var(--surface-border);
+    }
+
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      padding: 1rem;
+      z-index: 50;
+      backdrop-filter: blur(4px);
+    }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--surface-border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+      max-width: 600px;
+      width: 100%;
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+
+    .copy-box {
+      background: #0f172a;
+      border: 1px solid var(--surface-border);
+      border-radius: 0.5rem;
+      padding: 1rem;
+      font-family: monospace;
+      font-size: 0.8125rem;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+      margin: 1rem 0;
+      color: #38bdf8;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+      border-bottom: 1px solid var(--surface-border);
+      padding-bottom: 0.5rem;
+    }
+
+    .tab-btn {
+      background: transparent;
+      color: var(--text-muted);
+      border-radius: 0.5rem;
+      padding: 0.5rem 1rem;
+    }
+
+    .tab-btn.active {
+      background: var(--surface);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      background: var(--success);
+      color: #fff;
+      padding: 0.75rem 1.25rem;
+      border-radius: 0.5rem;
+      font-weight: 500;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      display: none;
+      z-index: 99;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo-area">
+        <h1>
+          <span>🛡️ RGAA Audit</span>
+          <span class="badge badge-success"><span class="pulse"></span> En ligne (Port 30019)</span>
+        </h1>
+        <p>Gestionnaire de licences & mises à jour WordPress</p>
+      </div>
+      <div class="header-actions">
+        <button class="btn-secondary btn-sm" onclick="showPublicKeyModal()">🔑 Clé publique PEM</button>
+        <a href="/v1/crl" target="_blank" style="text-decoration:none;"><button class="btn-secondary btn-sm">📜 Voir CRL</button></a>
+        <button class="btn-secondary btn-sm" onclick="loadData()">🔄 Rafraîchir</button>
+      </div>
+    </header>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <h3>Licences Actives</h3>
+        <div class="value" id="stat-active">-</div>
+      </div>
+      <div class="stat-card">
+        <h3>Total Émises</h3>
+        <div class="value" id="stat-total">-</div>
+      </div>
+      <div class="stat-card">
+        <h3>Activations WordPress</h3>
+        <div class="value" id="stat-activations">-</div>
+      </div>
+      <div class="stat-card">
+        <h3>Alertes Partage (> 1 domaine)</h3>
+        <div class="value" id="stat-shared" style="color: var(--warning);">-</div>
+      </div>
+    </div>
+
+    <!-- Formulaire d'émission -->
+    <div class="card">
+      <div class="card-title">
+        <span>✨ Générer une nouvelle clé de licence</span>
+      </div>
+      <form id="issue-form" onsubmit="handleIssueLicense(event)">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="email">Email client</label>
+            <input type="email" id="email" required placeholder="client@exemple.fr">
+          </div>
+          <div class="form-group">
+            <label for="plan">Plan</label>
+            <select id="plan">
+              <option value="solo">Solo (1 site)</option>
+              <option value="agence">Agence (Multi-sites)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="sites">Nombre de sites</label>
+            <input type="number" id="sites" value="1" min="1" max="999">
+          </div>
+          <div class="form-group">
+            <label for="domain">Domaine autorisé (* = illimité)</label>
+            <input type="text" id="domain" required placeholder="exemple.fr ou *" value="*">
+          </div>
+          <div class="form-group">
+            <label for="expires">Date d'expiration</label>
+            <input type="date" id="expires" required>
+          </div>
+          <div class="form-group">
+            <button type="submit" class="btn-primary" style="height: 42px;">Générer la clé</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <!-- Navigation Onglets -->
+    <div class="tabs">
+      <button class="tab-btn active" id="tab-btn-licenses" onclick="switchTab('licenses')">Toutes les licences</button>
+      <button class="tab-btn" id="tab-btn-shared" onclick="switchTab('shared')">Alertes de partage (<span id="shared-count">0</span>)</button>
+    </div>
+
+    <!-- Table Licences -->
+    <div id="tab-licenses" class="card">
+      <div class="card-title">
+        <span>Liste des Licences</span>
+        <input type="text" id="search-input" placeholder="Rechercher par domaine, email..." oninput="filterLicenses()" style="width: 250px;">
+      </div>
+      <div class="table-container">
+        <table id="licenses-table">
+          <thead>
+            <tr>
+              <th>Statut</th>
+              <th>Domaine</th>
+              <th>Plan</th>
+              <th>Email</th>
+              <th>Expiration</th>
+              <th>Activations</th>
+              <th>Clé signée</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="licenses-tbody">
+            <tr><td colspan="8" class="empty-state">Chargement des données...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Table Alertes Partage -->
+    <div id="tab-shared" class="card" style="display: none;">
+      <div class="card-title">
+        <span>Licences Actives Détectées sur Plusieurs Domaines</span>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>ID Licence</th>
+              <th>Email</th>
+              <th>Plan</th>
+              <th>Domaine Licencié</th>
+              <th>Domaines Distincts Activés</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="shared-tbody">
+            <tr><td colspan="6" class="empty-state">Chargement...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Affichage Clé -->
+  <div class="modal-overlay" id="key-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">Clé de licence générée</h3>
+        <button class="btn-secondary btn-sm" onclick="closeModal('key-modal')">✕</button>
+      </div>
+      <p style="font-size: 0.875rem; color: var(--text-muted);">
+        Copiez cette clé complète dans l'administration WordPress (<em>RGAA Audit > Réglages > Clé de licence</em>) :
+      </p>
+      <div class="copy-box" id="modal-key-content"></div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
+        <button class="btn-primary" onclick="copyModalKey()">📋 Copier la clé</button>
+        <button class="btn-secondary" onclick="closeModal('key-modal')">Fermer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Clé Publique PEM -->
+  <div class="modal-overlay" id="public-key-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Clé Publique RSA (Format PEM)</h3>
+        <button class="btn-secondary btn-sm" onclick="closeModal('public-key-modal')">✕</button>
+      </div>
+      <p style="font-size: 0.875rem; color: var(--text-muted);">
+        À embarquer dans le plugin WordPress pour la vérification hors ligne :
+      </p>
+      <div class="copy-box" id="modal-public-key-content"></div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
+        <button class="btn-primary" onclick="copyPublicKey()">📋 Copier la clé publique</button>
+        <button class="btn-secondary" onclick="closeModal('public-key-modal')">Fermer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast">Copié dans le presse-papier !</div>
+
+  <script>
+    let allLicenses = [];
+
+    // Set default expiration date to +1 year
+    const nextYear = new Date();
+    nextYear.setFullYear(nextYear.getFullYear() + 1);
+    document.getElementById('expires').value = nextYear.toISOString().split('T')[0];
+
+    async function loadData() {
+      try {
+        const [licRes, statsRes, sharedRes] = await Promise.all([
+          fetch('/api/licenses'),
+          fetch('/api/stats'),
+          fetch('/api/shared')
+        ]);
+
+        allLicenses = await licRes.json();
+        const stats = await statsRes.json();
+        const shared = await sharedRes.json();
+
+        // Update stats
+        document.getElementById('stat-active').textContent = stats.active || 0;
+        document.getElementById('stat-total').textContent = stats.total || 0;
+        document.getElementById('stat-activations').textContent = stats.activations || 0;
+        document.getElementById('stat-shared').textContent = shared.length || 0;
+        document.getElementById('shared-count').textContent = shared.length || 0;
+
+        renderLicenses(allLicenses);
+        renderShared(shared);
+      } catch (err) {
+        console.error('Error loading data:', err);
+      }
+    }
+
+    function renderLicenses(licenses) {
+      const tbody = document.getElementById('licenses-tbody');
+      if (!licenses || licenses.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Aucune licence enregistrée pour le moment.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = licenses.map(lic => {
+        const isRevoked = lic.status === 'revoked' || lic.status === 'refunded';
+        const badgeClass = isRevoked ? 'badge-danger' : 'badge-success';
+        const statusLabel = isRevoked ? 'Révoquée' : 'Active';
+        const activationsCount = lic.activations_count || 0;
+
+        return `
+          <tr>
+            <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
+            <td><strong>${escapeHtml(lic.domain)}</strong></td>
+            <td><span class="badge badge-warning">${escapeHtml(lic.plan)}</span></td>
+            <td>${escapeHtml(lic.email)}</td>
+            <td>${escapeHtml(lic.expires_at)}</td>
+            <td>${activationsCount} site(s)</td>
+            <td>
+              <span class="key-preview" title="${escapeHtml(lic.key)}">${escapeHtml(lic.key)}</span>
+              <button class="btn-secondary btn-sm" onclick="copyText('${lic.key}')">📋</button>
+            </td>
+            <td>
+              <div style="display: flex; gap: 0.4rem;">
+                <button class="btn-secondary btn-sm" onclick="viewKey('${lic.id}')">Voir</button>
+                ${!isRevoked ? `<button class="btn-danger btn-sm" onclick="handleRevoke('${lic.id}')">Révoquer</button>` : ''}
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderShared(shared) {
+      const tbody = document.getElementById('shared-tbody');
+      if (!shared || shared.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Aucune licence partagée sur plusieurs domaines distincts. Tout est normal !</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = shared.map(item => `
+        <tr>
+          <td><code style="font-size:0.75rem;">${escapeHtml(item.id)}</code></td>
+          <td>${escapeHtml(item.email)}</td>
+          <td><span class="badge badge-warning">${escapeHtml(item.plan)}</span></td>
+          <td><strong>${escapeHtml(item.licensed_domain)}</strong></td>
+          <td><span style="color:var(--warning); font-weight:600;">${item.active_domains_count}</span> (${escapeHtml(item.active_domains)})</td>
+          <td>
+            <button class="btn-danger btn-sm" onclick="handleRevoke('${item.id}')">Révoquer</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function filterLicenses() {
+      const q = document.getElementById('search-input').value.toLowerCase();
+      const filtered = allLicenses.filter(lic => 
+        (lic.email && lic.email.toLowerCase().includes(q)) ||
+        (lic.domain && lic.domain.toLowerCase().includes(q)) ||
+        (lic.id && lic.id.toLowerCase().includes(q))
+      );
+      renderLicenses(filtered);
+    }
+
+    async function handleIssueLicense(e) {
+      e.preventDefault();
+      const email = document.getElementById('email').value.trim();
+      const plan = document.getElementById('plan').value;
+      const sites = parseInt(document.getElementById('sites').value, 10);
+      const domain = document.getElementById('domain').value.trim();
+      const expires = document.getElementById('expires').value;
+
+      try {
+        const res = await fetch('/api/licenses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, plan, sites, domain, expires })
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          alert('Erreur: ' + (err.error || 'Impossible de créer la licence'));
+          return;
+        }
+
+        const data = await res.json();
+        document.getElementById('modal-title').textContent = 'Licence générée avec succès !';
+        document.getElementById('modal-key-content').textContent = data.key;
+        document.getElementById('key-modal').style.display = 'flex';
+
+        // Reset domain and refresh list
+        document.getElementById('email').value = '';
+        loadData();
+      } catch (err) {
+        alert('Erreur réseau: ' + err.message);
+      }
+    }
+
+    async function handleRevoke(id) {
+      const reason = prompt('Motif de la révocation (ex: refund, dispute, chargeback) :', 'refund');
+      if (reason === null) return;
+
+      try {
+        const res = await fetch(`/api/licenses/${id}/revoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason })
+        });
+
+        if (res.ok) {
+          showToast('Licence révoquée avec succès');
+          loadData();
+        } else {
+          alert('Erreur lors de la révocation');
+        }
+      } catch (err) {
+        alert('Erreur: ' + err.message);
+      }
+    }
+
+    function viewKey(id) {
+      const lic = allLicenses.find(l => l.id === id);
+      if (!lic) return;
+      document.getElementById('modal-title').textContent = `Clé de licence (${lic.domain})`;
+      document.getElementById('modal-key-content').textContent = lic.key;
+      document.getElementById('key-modal').style.display = 'flex';
+    }
+
+    async function showPublicKeyModal() {
+      try {
+        const res = await fetch('/v1/public-key');
+        const pubKey = await res.text();
+        document.getElementById('modal-public-key-content').textContent = pubKey;
+        document.getElementById('public-key-modal').style.display = 'flex';
+      } catch (err) {
+        alert('Impossible de récupérer la clé publique: ' + err.message);
+      }
+    }
+
+    function closeModal(modalId) {
+      document.getElementById(modalId).style.display = 'none';
+    }
+
+    function copyModalKey() {
+      const key = document.getElementById('modal-key-content').textContent;
+      copyText(key);
+    }
+
+    function copyPublicKey() {
+      const key = document.getElementById('modal-public-key-content').textContent;
+      copyText(key);
+    }
+
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast('Copié dans le presse-papier !');
+      }).catch(() => {
+        const input = document.createElement('textarea');
+        input.value = text;
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand('copy');
+        document.body.removeChild(input);
+        showToast('Copié dans le presse-papier !');
+      });
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.style.display = 'block';
+      setTimeout(() => { toast.style.display = 'none'; }, 2500);
+    }
+
+    function switchTab(tab) {
+      document.getElementById('tab-licenses').style.display = tab === 'licenses' ? 'block' : 'none';
+      document.getElementById('tab-shared').style.display = tab === 'shared' ? 'block' : 'none';
+      document.getElementById('tab-btn-licenses').className = 'tab-btn' + (tab === 'licenses' ? ' active' : '');
+      document.getElementById('tab-btn-shared').className = 'tab-btn' + (tab === 'shared' ? ' active' : '');
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      })[m]);
+    }
+
+    // Initial load
+    loadData();
+  </script>
+</body>
+</html>

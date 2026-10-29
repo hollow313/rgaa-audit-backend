@@ -75,17 +75,6 @@ async function main() {
       const licenseId = crypto.randomUUID();
       const normalizedDomain = normalizeDomain(domain);
 
-      db.createLicense({
-        id: licenseId,
-        email,
-        plan,
-        sites,
-        domain: normalizedDomain,
-        expires_at: expires,
-        provider: 'manual',
-        status: 'active'
-      });
-
       const payload = {
         id: licenseId,
         license_id: licenseId,
@@ -97,6 +86,18 @@ async function main() {
       };
 
       const signed = signLicense(payload);
+
+      db.createLicense({
+        id: licenseId,
+        email,
+        plan,
+        sites,
+        domain: normalizedDomain,
+        expires_at: expires,
+        provider: 'manual',
+        status: 'active',
+        signed_key: signed.key
+      });
 
       console.log('\n--- Licence générée avec succès ---');
       console.log(`ID:      ${licenseId}`);

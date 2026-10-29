@@ -27,6 +27,49 @@ describe('API Endpoints', () => {
     await new Promise((resolve) => server.close(resolve));
   });
 
+  it('GET / returns HTML dashboard', async () => {
+    const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('RGAA Audit'));
+    assert.ok(html.includes('licenses-table'));
+  });
+
+  it('Web UI API: POST /api/licenses creates license and returns signed key', async () => {
+    const res = await fetch(`${baseUrl}/api/licenses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'webuser@example.com',
+        plan: 'solo',
+        sites: 1,
+        domain: 'webtest.fr',
+        expires: '2029-10-10'
+      })
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.ok(data.key.includes('.'));
+    assert.equal(data.license.domain, 'webtest.fr');
+  });
+
+  it('Web UI API: GET /api/licenses lists licenses with keys', async () => {
+    const res = await fetch(`${baseUrl}/api/licenses`);
+    assert.equal(res.status, 200);
+    const list = await res.json();
+    assert.ok(Array.isArray(list));
+    assert.ok(list.some(l => l.domain === 'webtest.fr' && l.key));
+  });
+
+  it('Web UI API: GET /api/stats returns counts', async () => {
+    const res = await fetch(`${baseUrl}/api/stats`);
+    assert.equal(res.status, 200);
+    const stats = await res.json();
+    assert.ok(typeof stats.total === 'number');
+    assert.ok(typeof stats.active === 'number');
+  });
+
   it('GET /healthz returns ok and db status', async () => {
     const res = await fetch(`${baseUrl}/healthz`);
     assert.equal(res.status, 200);

@@ -54,7 +54,8 @@ function initSchema(db) {
       provider_ref  TEXT,                          -- id d'abonnement / de commande
       created_at    TEXT NOT NULL,
       revoked_at    TEXT,
-      revoke_reason TEXT
+      revoke_reason TEXT,
+      signed_key    TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_provider_ref ON licenses(provider, provider_ref);
 
@@ -85,14 +86,21 @@ function initSchema(db) {
       published_at TEXT NOT NULL
     );
   `);
+
+  // Migration for signed_key column in case table already existed
+  try {
+    db.exec('ALTER TABLE licenses ADD COLUMN signed_key TEXT;');
+  } catch {
+    // Column already exists
+  }
 }
 
 function createLicense(data, customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`
     INSERT INTO licenses (
-      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, created_at, signed_key
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     data.id,
@@ -104,7 +112,8 @@ function createLicense(data, customDb = null) {
     data.status || 'active',
     data.provider || 'manual',
     data.provider_ref || null,
-    data.created_at || new Date().toISOString()
+    data.created_at || new Date().toISOString(),
+    data.signed_key || null
   );
   return getLicenseById(data.id, db);
 }
@@ -136,11 +145,33 @@ function updateLicenseStatus(id, status, reason = null, customDb = null) {
 function listLicenses(filters = {}, customDb = null) {
   const db = customDb || getDb();
   if (filters.status) {
-    const stmt = db.prepare('SELECT * FROM licenses WHERE status = ? ORDER BY created_at DESC');
+    const stmt = db.prepare(`
+      SELECT l.*, COUNT(a.domain) as activations_count
+      FROM licenses l
+      LEFT JOIN activations a ON a.license_id = l.id
+      WHERE l.status = ?
+      GROUP BY l.id
+      ORDER BY l.created_at DESC
+    `);
     return stmt.all(filters.status);
   }
-  const stmt = db.prepare('SELECT * FROM licenses ORDER BY created_at DESC');
+  const stmt = db.prepare(`
+    SELECT l.*, COUNT(a.domain) as activations_count
+    FROM licenses l
+    LEFT JOIN activations a ON a.license_id = l.id
+    GROUP BY l.id
+    ORDER BY l.created_at DESC
+  `);
   return stmt.all();
+}
+
+function getLicenseStats(customDb = null) {
+  const db = customDb || getDb();
+  const total = db.prepare('SELECT COUNT(*) as count FROM licenses').get()?.count || 0;
+  const active = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE status = 'active'").get()?.count || 0;
+  const revoked = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE status IN ('revoked', 'refunded')").get()?.count || 0;
+  const activations = db.prepare('SELECT COUNT(*) as count FROM activations').get()?.count || 0;
+  return { total, active, revoked, activations };
 }
 
 function recordActivation({ license_id, domain, plugin_version }, customDb = null) {
@@ -256,6 +287,7 @@ module.exports = {
   getLicenseByProviderRef,
   updateLicenseStatus,
   listLicenses,
+  getLicenseStats,
   recordActivation,
   getActivations,
   getSharedLicenses,

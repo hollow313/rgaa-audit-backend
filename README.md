@@ -8,12 +8,29 @@ Le serveur s'exécute dans un conteneur léger **Linux Alpine**, avec un utilisa
 
 ## Fonctionnalités
 
-1. **Génération de licences signées (RSA-SHA256)** : compatible avec le contrat de vérification hors ligne du plugin WordPress (`openssl_verify()`).
-2. **Liste de révocation signée (CRL)** : distribution de la liste des licences annulées ou remboursées avec horodatage anti-rejeu (`next_update`).
-3. **Distribution des mises à jour** : manifeste signé (`/v1/updates/:slug`) et téléchargement sécurisé des archives ZIP avec vérification SHA-256.
-4. **Enregistrement des activations (opt-in)** : suivi des domaines actifs sans collecte d'IP ni de données personnelles pour détecter le partage abusif.
-5. **Webhooks e-commerce (Polar / Paddle)** : émission et révocation automatisées après paiement, avec idempotence stricte.
-6. **CLI intégrée** : génération, révocation, vérification et publication directement en ligne de commande.
+1. **Interface Web d'administration (Port 30019)** : tableau de bord interactif accessible via navigateur pour émettre, consulter, copier et révoquer les clés de licence en direct.
+2. **Génération de licences signées (RSA-SHA256)** : compatible avec le contrat de vérification hors ligne du plugin WordPress (`openssl_verify()`).
+3. **Liste de révocation signée (CRL)** : distribution de la liste des licences annulées ou remboursées avec horodatage anti-rejeu (`next_update`).
+4. **Distribution des mises à jour** : manifeste signé (`/v1/updates/:slug`) et téléchargement sécurisé des archives ZIP avec vérification SHA-256.
+5. **Enregistrement des activations (opt-in)** : suivi des domaines actifs sans collecte d'IP ni de données personnelles pour détecter le partage abusif.
+6. **Webhooks e-commerce (Polar / Paddle)** : émission et révocation automatisées après paiement, avec idempotence stricte.
+7. **CLI intégrée** : génération, révocation, vérification et publication directement en ligne de commande.
+
+---
+
+## Interface Web Dashboard
+
+Ouvrez simplement l'adresse suivante dans votre navigateur :
+
+```
+http://<IP-du-NAS-ou-serveur>:30019/
+```
+
+Fonctionnalités disponibles sur l'interface :
+- **Émission de clés** : formulaire guidé (email, plan solo/agence, nombre de sites, domaine ou `*`, expiration).
+- **Gestion des licences** : tableau complet avec recherche instantanée, copie de la clé signée en 1 clic et révocation.
+- **Détection du partage** : onglet dédié listant les clés actives constatées sur plus d'un domaine distinct.
+- **Clé publique PEM** : visualisation et copie en un clic de la clé publique à intégrer dans le plugin WordPress.
 
 ---
 

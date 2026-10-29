@@ -23,6 +23,12 @@ app.use(express.json({
   }
 }));
 
+// Serve static frontend files from public/
+const publicDir = path.join(__dirname, 'public');
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir));
+}
+
 // In-memory rate limiting maps
 const keyLimits = new Map();
 const ipLimits = new Map();
@@ -53,16 +59,19 @@ function rateLimit(map, key, maxRequests, windowMs) {
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    const duration = Date.now() - start;
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      method: req.method,
-      path: req.baseUrl + req.path,
-      status: res.statusCode,
-      duration_ms: duration,
-      ip: req.ip || req.socket.remoteAddress
-    };
-    process.stdout.write(JSON.stringify(logEntry) + '\n');
+    // Only log API requests, skip static asset spam
+    if (req.path.startsWith('/v1/') || req.path.startsWith('/api/') || req.path === '/healthz') {
+      const duration = Date.now() - start;
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        method: req.method,
+        path: req.baseUrl + req.path,
+        status: res.statusCode,
+        duration_ms: duration,
+        ip: req.ip || req.socket.remoteAddress
+      };
+      process.stdout.write(JSON.stringify(logEntry) + '\n');
+    }
   });
   next();
 });
@@ -70,7 +79,6 @@ app.use((req, res, next) => {
 // Admin authorization middleware
 function requireAdmin(req, res, next) {
   if (!config.adminApiKey) {
-    // If no admin key configured, allow access or warn
     return next();
   }
   const authHeader = req.headers.authorization || '';
@@ -80,6 +88,129 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
+
+/* ----------------------------------------------------
+   Web UI Dashboard API
+---------------------------------------------------- */
+
+// Serve index.html explicitly on root
+app.get('/', (req, res) => {
+  const indexPath = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+  res.send('RGAA License Server is running.');
+});
+
+// Stats for dashboard
+app.get('/api/stats', (req, res) => {
+  try {
+    const stats = db.getLicenseStats();
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List licenses with signed keys for the dashboard
+app.get('/api/licenses', (req, res) => {
+  try {
+    const rawLicenses = db.listLicenses();
+    const licensesWithKeys = rawLicenses.map(lic => {
+      let key = lic.signed_key;
+      if (!key) {
+        const signed = signLicense({
+          id: lic.id,
+          license_id: lic.id,
+          plan: lic.plan,
+          sites: lic.sites,
+          expires: lic.expires_at,
+          domain: lic.domain,
+          issued_at: lic.created_at
+        });
+        key = signed.key;
+      }
+      return {
+        ...lic,
+        key
+      };
+    });
+    res.json(licensesWithKeys);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Issue license from Web UI
+app.post('/api/licenses', (req, res) => {
+  try {
+    const { email, plan, sites, domain, expires } = req.body || {};
+    if (!email || !domain || !expires) {
+      return res.status(400).json({ error: 'Email, domaine et date d\'expiration requis.' });
+    }
+
+    const licenseId = crypto.randomUUID();
+    const normalizedDomain = normalizeDomain(domain);
+    const sitesCount = sites ? parseInt(sites, 10) : 1;
+
+    const payload = {
+      id: licenseId,
+      license_id: licenseId,
+      plan: plan || 'solo',
+      sites: sitesCount,
+      expires: expires,
+      domain: normalizedDomain,
+      issued_at: new Date().toISOString()
+    };
+
+    const signed = signLicense(payload);
+
+    const record = db.createLicense({
+      id: licenseId,
+      email,
+      plan: payload.plan,
+      sites: sitesCount,
+      domain: normalizedDomain,
+      expires_at: expires,
+      provider: 'web',
+      status: 'active',
+      signed_key: signed.key
+    });
+
+    res.json({
+      ok: true,
+      license: record,
+      key: signed.key
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Revoke license from Web UI
+app.post('/api/licenses/:id/revoke', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+    const updated = db.updateLicenseStatus(id, 'revoked', reason || 'web_revocation');
+    if (!updated) {
+      return res.status(404).json({ error: 'Licence introuvable' });
+    }
+    res.json({ ok: true, license: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shared licenses for dashboard alerts
+app.get('/api/shared', (req, res) => {
+  try {
+    const shared = db.getSharedLicenses();
+    res.json(shared);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ----------------------------------------------------
    Endpoints
@@ -297,18 +428,6 @@ app.post('/v1/webhook/polar', async (req, res) => {
       expiresDate.setFullYear(expiresDate.getFullYear() + 1);
       const expires = expiresDate.toISOString().split('T')[0];
 
-      db.createLicense({
-        id: licenseId,
-        email,
-        plan,
-        sites,
-        domain: normalizeDomain(domain),
-        expires_at: expires,
-        provider: 'polar',
-        provider_ref: data.subscription_id || data.order_id || event.id,
-        status: 'active'
-      });
-
       const payload = {
         id: licenseId,
         license_id: licenseId,
@@ -320,6 +439,19 @@ app.post('/v1/webhook/polar', async (req, res) => {
       };
 
       const signed = signLicense(payload);
+
+      db.createLicense({
+        id: licenseId,
+        email,
+        plan,
+        sites,
+        domain: normalizeDomain(domain),
+        expires_at: expires,
+        provider: 'polar',
+        provider_ref: data.subscription_id || data.order_id || event.id,
+        status: 'active',
+        signed_key: signed.key
+      });
 
       // Async email sending
       sendLicenseEmail({
@@ -380,18 +512,6 @@ app.post('/v1/webhook/paddle', async (req, res) => {
       expiresDate.setFullYear(expiresDate.getFullYear() + 1);
       const expires = expiresDate.toISOString().split('T')[0];
 
-      db.createLicense({
-        id: licenseId,
-        email,
-        plan,
-        sites,
-        domain: normalizeDomain(domain),
-        expires_at: expires,
-        provider: 'paddle',
-        provider_ref: data.subscription_id || data.id || eventId,
-        status: 'active'
-      });
-
       const payload = {
         id: licenseId,
         license_id: licenseId,
@@ -403,6 +523,19 @@ app.post('/v1/webhook/paddle', async (req, res) => {
       };
 
       const signed = signLicense(payload);
+
+      db.createLicense({
+        id: licenseId,
+        email,
+        plan,
+        sites,
+        domain: normalizeDomain(domain),
+        expires_at: expires,
+        provider: 'paddle',
+        provider_ref: data.subscription_id || data.id || eventId,
+        status: 'active',
+        signed_key: signed.key
+      });
 
       sendLicenseEmail({
         to: email,
@@ -449,29 +582,30 @@ app.post('/v1/admin/issue', requireAdmin, (req, res) => {
   const licenseId = crypto.randomUUID();
   const normalizedDomain = normalizeDomain(domain);
 
-  const licenseRecord = db.createLicense({
-    id: licenseId,
-    email,
-    plan: plan || 'solo',
-    sites: sites ? parseInt(sites, 10) : 1,
-    domain: normalizedDomain,
-    expires_at: expires,
-    provider: provider || 'manual',
-    provider_ref: provider_ref || null,
-    status: 'active'
-  });
-
   const payload = {
     id: licenseId,
     license_id: licenseId,
-    plan: licenseRecord.plan,
-    sites: licenseRecord.sites,
-    expires: licenseRecord.expires_at,
+    plan: plan || 'solo',
+    sites: sites ? parseInt(sites, 10) : 1,
+    expires: expires,
     domain: normalizedDomain,
     issued_at: new Date().toISOString()
   };
 
   const signed = signLicense(payload);
+
+  const licenseRecord = db.createLicense({
+    id: licenseId,
+    email,
+    plan: payload.plan,
+    sites: payload.sites,
+    domain: normalizedDomain,
+    expires_at: expires,
+    provider: provider || 'manual',
+    provider_ref: provider_ref || null,
+    status: 'active',
+    signed_key: signed.key
+  });
 
   res.json({
     license: licenseRecord,
