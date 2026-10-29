@@ -1,0 +1,13 @@
+node_modules
+.git
+.github
+keys
+*.pem
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.env
+.env.*
+test
+docs

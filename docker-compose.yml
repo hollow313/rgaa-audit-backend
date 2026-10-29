@@ -1,0 +1,32 @@
+services:
+  license-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hollow313/rgaa-audit-backend:latest
+    container_name: rgaa-license-server
+    restart: unless-stopped
+    user: "568:568"
+    ports:
+      - "30019:30019"
+    volumes:
+      - ./keys:/keys
+    environment:
+      - PORT=30019
+      - HOST=0.0.0.0
+      - KEYS_DIR=/keys
+      - KEY_PATH=/keys/private.pem
+      - PUBLIC_KEY_PATH=/keys/public.pem
+      - DB_PATH=/keys/licenses.sqlite
+      - AUTO_GENERATE_KEYS=true
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      - POLAR_WEBHOOK_SECRET=${POLAR_WEBHOOK_SECRET:-}
+      - PADDLE_WEBHOOK_SECRET=${PADDLE_WEBHOOK_SECRET:-}
+      - SMTP_URL=${SMTP_URL:-}
+      - SMTP_FROM=${SMTP_FROM:-licenses@exemple.fr}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:30019/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

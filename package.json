@@ -1,0 +1,30 @@
+{
+  "name": "rgaa-audit-backend",
+  "version": "1.0.0",
+  "description": "License and update server for RGAA Audit plugin",
+  "main": "src/server.js",
+  "bin": {
+    "rgaa-license-cli": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "cli": "node src/cli.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "keywords": [
+    "rgaa",
+    "license-server",
+    "updates",
+    "crl"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "nodemailer": "^10.3.1"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

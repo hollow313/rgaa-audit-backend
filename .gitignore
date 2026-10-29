@@ -1,0 +1,12 @@
+node_modules/
+keys/
+*.pem
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.env
+.DS_Store
+Thumbs.db
+dist/
+coverage/
