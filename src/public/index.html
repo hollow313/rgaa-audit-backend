@@ -494,6 +494,14 @@
       }
     }
 
+    // Auto-save token if provided via query string (?token=...)
+    try {
+      const urlToken = new URLSearchParams(window.location.search).get('token');
+      if (urlToken) {
+        setAdminToken(urlToken);
+      }
+    } catch (e) {}
+
     function promptChangeAdminToken() {
       const current = getAdminToken();
       const nextToken = prompt('Jeton administrateur pour l\'API (ADMIN_TOKEN) :', current);

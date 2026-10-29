@@ -13,6 +13,15 @@ function resolveKeysDir() {
   return path.resolve(process.cwd(), 'keys');
 }
 
+function parsePaymentProviders(val) {
+  if (val === undefined || val === null) return ['polar'];
+  const trimmed = val.trim().toLowerCase();
+  if (!trimmed || ['none', 'off', 'disabled', 'manual', 'false'].includes(trimmed)) {
+    return [];
+  }
+  return trimmed.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 const keysDir = resolveKeysDir();
 
 const config = {
@@ -27,7 +36,7 @@ const config = {
   adminApiKey: process.env.ADMIN_API_KEY || process.env.ADMIN_TOKEN || '',
   polarWebhookSecret: process.env.POLAR_WEBHOOK_SECRET || '',
   paddleWebhookSecret: process.env.PADDLE_WEBHOOK_SECRET || '',
-  paymentProviders: (process.env.PAYMENT_PROVIDERS || 'polar').toLowerCase().split(',').map(s => s.trim()).filter(Boolean),
+  paymentProviders: parsePaymentProviders(process.env.PAYMENT_PROVIDERS),
   eventsRetentionDays: Math.max(7, parseInt(process.env.EVENTS_RETENTION_DAYS || '90', 10)),
   smtpUrl: process.env.SMTP_URL || '',
   smtpFrom: process.env.SMTP_FROM || 'licenses@exemple.fr',

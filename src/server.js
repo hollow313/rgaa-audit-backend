@@ -25,10 +25,10 @@ app.use(express.json({
   }
 }));
 
-// Serve static frontend files from public/
+// Serve static frontend files from public/ (without automatically serving index.html on /)
 const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
-  app.use(express.static(publicDir));
+  app.use(express.static(publicDir, { index: false }));
 }
 
 // In-memory rate limiting maps
@@ -185,33 +185,47 @@ function invalidateCrlCache() {
    Web UI Dashboard API & Admin Security (P0)
 ---------------------------------------------------- */
 
-// Admin authentication middleware for all /api/* routes
-function requireAdminToken(req, res, next) {
-  const authHeader = req.headers['authorization'] || '';
-  if (!authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  const token = authHeader.slice(7).trim();
+// Helper to check admin authorization via Bearer header, Basic auth, or ?token= query parameter
+function checkAdminToken(req) {
   const expectedToken = config.adminToken;
-  if (!expectedToken) {
-    return res.status(401).json({ error: 'unauthorized' });
+  if (!expectedToken) return false;
+
+  const authHeader = req.headers['authorization'] || '';
+  let token = '';
+
+  if (authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice(7).trim();
+  } else if (authHeader.startsWith('Basic ')) {
+    const credentials = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+    const parts = credentials.split(':');
+    token = (parts[1] || parts[0] || '').trim();
+  } else if (req.query && req.query.token) {
+    token = String(req.query.token).trim();
   }
 
+  if (!token) return false;
   const tokenBuf = Buffer.from(token);
   const expectedBuf = Buffer.from(expectedToken);
+  return tokenBuf.length === expectedBuf.length && crypto.timingSafeEqual(tokenBuf, expectedBuf);
+}
 
-  if (tokenBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(tokenBuf, expectedBuf)) {
+// Admin authentication middleware for all /api/* routes
+function requireAdminToken(req, res, next) {
+  if (!checkAdminToken(req)) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-
   next();
 }
 
 app.use('/api', requireAdminToken);
 
-// Serve index.html on root
+// Serve index.html on root (strictly protected by ADMIN_TOKEN)
 app.get('/', (req, res) => {
+  if (!checkAdminToken(req)) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="RGAA Audit Admin"');
+    return res.status(401).send('Accès restreint (401) : Jeton ADMIN_TOKEN requis.');
+  }
+
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
     return res.sendFile(indexPath);

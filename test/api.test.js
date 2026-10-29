@@ -61,12 +61,27 @@ describe('API Endpoints', () => {
     await new Promise((resolve) => server.close(resolve));
   });
 
-  it('GET / returns HTML dashboard', async () => {
+  it('GET / rejects unauthenticated request with 401 and WWW-Authenticate header', async () => {
     const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 401);
+    assert.ok(res.headers.get('www-authenticate')?.includes('Basic'));
+  });
+
+  it('GET / with valid ADMIN_TOKEN query parameter returns HTML dashboard', async () => {
+    const res = await fetch(`${baseUrl}/?token=${config.adminToken}`);
     assert.equal(res.status, 200);
     const html = await res.text();
     assert.ok(html.includes('RGAA Audit'));
     assert.ok(html.includes('licenses-table'));
+  });
+
+  it('GET / with valid Authorization Bearer header returns HTML dashboard', async () => {
+    const res = await fetch(`${baseUrl}/`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('RGAA Audit'));
   });
 
   it('P0: Web UI API: POST /api/licenses rejects unauthenticated call with 401', async () => {

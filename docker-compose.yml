@@ -19,11 +19,14 @@ services:
       - PUBLIC_KEY_PATH=/keys/public.pem
       - DB_PATH=/keys/licenses.sqlite
       - AUTO_GENERATE_KEYS=true
-      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - PAYMENT_PROVIDERS=${PAYMENT_PROVIDERS:-polar}
       - POLAR_WEBHOOK_SECRET=${POLAR_WEBHOOK_SECRET:-}
       - PADDLE_WEBHOOK_SECRET=${PADDLE_WEBHOOK_SECRET:-}
       - SMTP_URL=${SMTP_URL:-}
       - SMTP_FROM=${SMTP_FROM:-licenses@exemple.fr}
+      - EVENTS_RETENTION_DAYS=${EVENTS_RETENTION_DAYS:-90}
+      - CRL_VALIDITY_HOURS=${CRL_VALIDITY_HOURS:-24}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:30019/healthz"]
       interval: 30s

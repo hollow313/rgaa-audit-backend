@@ -18,17 +18,20 @@ Le serveur s'exécute dans un conteneur léger **Linux Alpine**, avec un utilisa
 
 ---
 
-## Interface Web Dashboard
+## Interface Web Dashboard & Sécurité
 
-Ouvrez simplement l'adresse suivante dans votre navigateur :
+L'accès au tableau de bord s'effectue via votre navigateur :
 
 ```
-http://<IP-du-serveur>:30019/
+http://<IP-du-serveur>:30019/?token=<ADMIN_TOKEN>
 ```
+ou directement `http://<IP-du-serveur>:30019/` (le navigateur ouvrira alors une boîte d'authentification HTTP Basic sécurisée pour renseigner votre `ADMIN_TOKEN`).
+
+Le jeton est ensuite mémorisé localement dans votre navigateur (`localStorage`), et vous pouvez à tout moment le modifier ou vous déconnecter via le bouton **`🔒 Token Admin`** situé dans l'en-tête.
 
 Fonctionnalités disponibles sur l'interface :
 - **Émission de clés** : formulaire guidé (email, plan solo/agence, nombre de sites, domaine ou `*`, expiration).
-- **Gestion des licences** : tableau complet avec recherche instantanée, copie de la clé signée en 1 clic et révocation.
+- **Gestion des licences** : tableau complet avec recherche instantanée, suivi des activations par rapport au quota (`✓ 1 / 1 site(s)`), copie de la clé signée en 1 clic et révocation immédiate.
 - **Détection du partage** : onglet dédié listant les clés actives constatées sur plus d'un domaine distinct.
 - **Clé publique PEM** : visualisation et copie en un clic de la clé publique à intégrer dans le plugin WordPress.
 
@@ -76,6 +79,8 @@ docker run -d \
   --name rgaa-license-server \
   --user 568:568 \
   -p 30019:30019 \
+  -e ADMIN_TOKEN="monSecretAdmin123!" \
+  -e PAYMENT_PROVIDERS="none" \
   -v $(pwd)/keys:/keys \
   --restart unless-stopped \
   holloow313/rgaa-audit-backend:latest
@@ -88,18 +93,45 @@ docker run -d \
 | Variable | Défaut | Description |
 |---|---|---|
 | `PORT` | `30019` | Port d'écoute HTTP du serveur |
-| `HOST` | `0.0.0.0` | Adresse d'écoute |
-| `KEYS_DIR` | `/keys` | Répertoire de stockage des clés et données |
+| `HOST` | `0.0.0.0` | Adresse d'écoute (toutes interfaces) |
+| `ADMIN_TOKEN` | *(vide)* | Jeton secret obligatoire pour protéger toutes les routes `/api/*` et le dashboard Web `GET /` |
+| `PAYMENT_PROVIDERS` | `polar` | Fournisseurs de paiement actifs : `polar`, `paddle`, ou `none` (si émission manuelle / hors ligne) |
+| `POLAR_WEBHOOK_SECRET` | *(vide)* | Clé secrète Standard Webhooks Polar (commençant par `whsec_...`) |
+| `PADDLE_WEBHOOK_SECRET` | *(vide)* | Clé secrète de signature des webhooks Paddle |
+| `KEYS_DIR` | `/keys` | Répertoire de stockage des clés et données SQLite |
 | `KEY_PATH` | `/keys/private.pem` | Chemin vers la clé privée RSA |
 | `PUBLIC_KEY_PATH` | `/keys/public.pem` | Chemin vers la clé publique RSA |
-| `DB_PATH` | `/keys/licenses.sqlite` | Chemin vers la base SQLite |
-| `AUTO_GENERATE_KEYS` | `true` | Génère automatiquement le trousseau RSA s'il est manquant |
-| `ADMIN_API_KEY` | *(vide)* | Clé secrète requise pour les routes `/v1/admin/*` |
-| `POLAR_WEBHOOK_SECRET` | *(vide)* | Clé secrète de signature des webhooks Polar |
-| `PADDLE_WEBHOOK_SECRET` | *(vide)* | Clé secrète de signature des webhooks Paddle |
-| `SMTP_URL` | *(vide)* | URL SMTP pour l'envoi des clés par email (`smtp://...`) |
-| `SMTP_FROM` | `licenses@exemple.fr` | Expéditeur des emails transactionnels |
-| `CRL_VALIDITY_HOURS` | `24` | Durée de validité de la CRL avant expiration du cache |
+| `DB_PATH` | `/keys/licenses.sqlite` | Chemin vers le fichier SQLite |
+| `AUTO_GENERATE_KEYS` | `true` | Génère automatiquement le trousseau RSA au premier lancement s'il est absent |
+| `EVENTS_RETENTION_DAYS` | `90` | Rétention RGPD des événements de paiement pour l'idempotence (en jours, min. 7) |
+| `SMTP_URL` | *(vide)* | URL SMTP pour l'envoi des clés par email (`smtp://user:pass@host:587`) |
+| `SMTP_FROM` | `licenses@exemple.fr` | Adresse d'expéditeur des emails transactionnels |
+| `CRL_VALIDITY_HOURS` | `24` | Durée de validité de la CRL avant régénération du cache |
+
+---
+
+## Déploiement sur Serveur & Résolution du statut « Déploiement »
+
+Les orchestrateurs de conteneurs sur serveur (Docker Compose, Kubernetes, Portainer, etc.) surveillent la disponibilité applicative via la sonde `HEALTHCHECK` qui interroge périodiquement `http://127.0.0.1:30019/healthz`.
+
+### Pourquoi le conteneur reste-t-il en statut « Déploiement » ?
+Par défaut, `PAYMENT_PROVIDERS` est configuré sur `polar`. Si la variable `POLAR_WEBHOOK_SECRET` n'a pas encore été renseignée dans la configuration de votre conteneur, l'endpoint `/healthz` renvoie volontairement un code **`503`**. Cela évite qu'un serveur de production encaisse des paiements sans pouvoir traiter les webhooks.
+
+Tant que `/healthz` renvoie 503, Docker considère le conteneur comme `unhealthy`, et le serveur d'applications l'affiche en statut **« Déploiement »** en attendant qu'il devienne sain.
+
+### Comment passer immédiatement au statut « En cours d'exécution » (Actif / Vert) :
+* **Cas 1 : Vous n'avez pas encore branché Polar (émission manuelle ou tests)** :
+  Ajoutez la variable d'environnement suivante dans les réglages de votre application :
+  ```env
+  PAYMENT_PROVIDERS=none
+  ```
+  Le healthcheck renverra immédiatement `200 {"ok":true,"db":true}` et le conteneur passera instantanément en vert !
+* **Cas 2 : Vous utilisez Polar pour les paiements en ligne** :
+  Renseignez simplement votre secret de webhook Polar dans les variables d'environnement :
+  ```env
+  POLAR_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  ```
+  Dès que le secret est détecté, `/healthz` répond `200` et le conteneur passe en actif.
 
 ---
 
@@ -174,15 +206,17 @@ docker exec -it rgaa-license-server node src/cli.js publish \
 |---|---|---|
 | `GET` | `/healthz` | Vérification de santé (`{ "ok": true, "db": true }`) |
 | `GET` | `/v1/public-key` | Récupération de la clé publique RSA en format PEM |
-| `POST` | `/v1/activate` | Vérification de licence et enregistrement du domaine |
+| `POST` | `/v1/activate` | Activation d'un domaine client et respect du quota de sites |
+| `POST` | `/v1/deactivate` | Désactivation d'un domaine pour libérer un slot de licence |
 | `GET` | `/v1/crl` | Liste de révocation signée (`Cache-Control: 3600`) |
-| `GET` | `/v1/updates/:slug` | Manifeste de mise à jour signé |
+| `GET` | `/v1/updates` / `/:slug` | Manifeste de mise à jour signé (exige `?key=...`) |
 | `GET` | `/v1/download/:version.zip?key=…` | Téléchargement du ZIP après validation de la clé |
-| `POST` | `/v1/webhook/polar` | Webhook de traitement des commandes Polar |
-| `POST` | `/v1/webhook/paddle` | Webhook de traitement des commandes Paddle |
-| `POST` | `/v1/admin/issue` | Émission d'une licence via API (avec `X-Admin-Key`) |
-| `POST` | `/v1/admin/revoke` | Révocation d'une licence via API |
-| `GET` | `/v1/admin/licenses` | Liste des licences (`?shared=true` disponible) |
+| `POST` | `/v1/webhook/polar` | Webhook Standard Webhooks Polar pour émission automatique |
+| `POST` | `/v1/webhook/paddle` | Webhook des commandes Paddle |
+| `GET` | `/api/licenses` | Liste des licences avec activations et clés (exige `ADMIN_TOKEN`) |
+| `POST` | `/api/licenses` | Création transactionnelle de licence (exige `ADMIN_TOKEN`) |
+| `POST` | `/api/licenses/:id/revoke` | Révocation immédiate d'une licence (exige `ADMIN_TOKEN`) |
+| `GET` | `/api/stats` | Métriques et statistiques du parc de licences |
 
 ---
 
