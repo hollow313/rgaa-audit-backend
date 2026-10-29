@@ -87,4 +87,9 @@ describe('Crypto Module', () => {
     assert.equal(verified.data.version, 1);
     assert.equal(verified.data.revoked[0].license_id, '123');
   });
+
+  it('P0: checkKeypair() returns true when pair matches', () => {
+    const { checkKeypair } = require('../src/crypto');
+    assert.equal(checkKeypair(), true);
+  });
 });

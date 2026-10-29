@@ -10,18 +10,28 @@ const { signLicense, initKeypair } = require('../src/crypto');
 function makeWebhookHeaders(provider, payload, secret, options = {}) {
   const timestamp = options.timestamp !== undefined ? options.timestamp : Math.floor(Date.now() / 1000);
   const rawBody = typeof payload === 'string' ? payload : JSON.stringify(payload);
-  const delimiter = provider === 'paddle' ? ':' : '.';
-  const signString = `${timestamp}${delimiter}${rawBody}`;
-  const sig = options.badSignature ? 'deadbeef1234' : crypto.createHmac('sha256', secret).update(signString).digest('hex');
-
   const headers = { 'Content-Type': 'application/json' };
   if (options.noHeaders) return headers;
 
   if (provider === 'paddle') {
+    const signString = `${timestamp}:${rawBody}`;
+    const sig = options.badSignature ? 'deadbeef1234' : crypto.createHmac('sha256', secret).update(signString).digest('hex');
     headers['paddle-signature'] = `ts=${timestamp};h1=${sig}`;
   } else {
+    // Polar / Standard Webhooks: {id}.{ts}.{rawBody}
+    const id = options.id || ('msg_test_' + Date.now());
+    headers['webhook-id'] = id;
     headers['webhook-timestamp'] = String(timestamp);
-    headers['webhook-signature'] = `v1=${sig}`;
+
+    let keyBuf;
+    if (secret.startsWith('whsec_')) {
+      keyBuf = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
+    } else {
+      keyBuf = Buffer.from(secret, 'utf8');
+    }
+    const toSign = Buffer.concat([Buffer.from(`${id}.${timestamp}.`), Buffer.from(rawBody, 'utf8')]);
+    const sig = options.badSignature ? 'deadbeef1234' : crypto.createHmac('sha256', keyBuf).update(toSign).digest('base64');
+    headers['webhook-signature'] = `v1,${sig}`;
   }
   return headers;
 }
@@ -323,6 +333,41 @@ describe('API Endpoints', () => {
     assert.equal(res2.status, 200);
     const b2 = await res2.json();
     assert.equal(b2.status, 'already_processed');
+  });
+
+  it('P0: POST /v1/webhook/polar handles Standard Webhooks with whsec_ base64 secret', async () => {
+    const prevSecret = config.polarWebhookSecret;
+    try {
+      const rawSecretBytes = crypto.randomBytes(32);
+      config.polarWebhookSecret = 'whsec_' + rawSecretBytes.toString('base64');
+
+      const eventId = 'evt_sw_' + Date.now();
+      const payload = {
+        id: eventId,
+        type: 'order.paid',
+        data: {
+          customer_email: 'buyer-sw@test.org',
+          plan: 'solo',
+          sites: 1,
+          domain: 'standardwebhooks.org',
+          order_id: 'ord_sw_' + Date.now()
+        }
+      };
+
+      const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+      const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload)
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.status, 'license_issued');
+      assert.ok(body.id);
+      assert.ok(body.key);
+    } finally {
+      config.polarWebhookSecret = prevSecret;
+    }
   });
 
   it('P0: POST /v1/webhook/paddle enforces HMAC and accepts valid signature', async () => {

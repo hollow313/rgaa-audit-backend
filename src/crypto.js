@@ -79,16 +79,33 @@ function getPublicKey() {
   return fs.readFileSync(config.publicKeyPath, 'utf8');
 }
 
+function checkKeypair() {
+  try {
+    const priv = getPrivateKey();
+    const pub = getPublicKey();
+    const nonce = Buffer.from('keypair_check_nonce_' + Date.now());
+    const sig = crypto.sign('sha256', nonce, priv);
+    return crypto.verify('sha256', nonce, pub, sig);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Sign raw data (string or object) with RSA-SHA256 and produce the payload.signature format
  */
 function signLicense(payloadObject) {
   const privateKey = getPrivateKey();
+  const publicKey = getPublicKey();
   const raw = typeof payloadObject === 'string' ? payloadObject : JSON.stringify(payloadObject);
 
-  const signer = crypto.createSign('SHA256');
-  signer.update(raw);
-  const sig = signer.sign(privateKey);
+  const sig = crypto.sign('sha256', Buffer.from(raw, 'utf8'), privateKey);
+
+  // Self-verification check before key leaves server (P0 auto-contrôle)
+  const isOk = crypto.verify('sha256', Buffer.from(raw, 'utf8'), publicKey, sig);
+  if (!isOk) {
+    throw new Error('Emission refusée : private.pem ne correspond pas à public.pem');
+  }
 
   const payloadB64 = toBase64Url(raw);
   const signatureB64 = toBase64Url(sig);
@@ -108,11 +125,16 @@ function signLicense(payloadObject) {
  */
 function signEnvelope(dataObject) {
   const privateKey = getPrivateKey();
+  const publicKey = getPublicKey();
   const raw = typeof dataObject === 'string' ? dataObject : JSON.stringify(dataObject);
 
-  const signer = crypto.createSign('SHA256');
-  signer.update(raw);
-  const sig = signer.sign(privateKey);
+  const sig = crypto.sign('sha256', Buffer.from(raw, 'utf8'), privateKey);
+
+  // Self-verification check before envelope leaves server
+  const isOk = crypto.verify('sha256', Buffer.from(raw, 'utf8'), publicKey, sig);
+  if (!isOk) {
+    throw new Error('Emission refusée : private.pem ne correspond pas à public.pem');
+  }
 
   return {
     payload: toBase64Url(raw),
@@ -201,6 +223,7 @@ module.exports = {
   fromBase64Url,
   normalizeDomain,
   initKeypair,
+  checkKeypair,
   getPrivateKey,
   getPublicKey,
   signLicense,

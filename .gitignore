@@ -10,3 +10,4 @@ keys/
 Thumbs.db
 dist/
 coverage/
+backups/

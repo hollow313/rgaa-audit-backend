@@ -26,6 +26,8 @@ const config = {
   adminApiKey: process.env.ADMIN_API_KEY || '',
   polarWebhookSecret: process.env.POLAR_WEBHOOK_SECRET || '',
   paddleWebhookSecret: process.env.PADDLE_WEBHOOK_SECRET || '',
+  paymentProviders: (process.env.PAYMENT_PROVIDERS || 'polar').toLowerCase().split(',').map(s => s.trim()).filter(Boolean),
+  eventsRetentionDays: Math.max(7, parseInt(process.env.EVENTS_RETENTION_DAYS || '90', 10)),
   smtpUrl: process.env.SMTP_URL || '',
   smtpFrom: process.env.SMTP_FROM || 'licenses@exemple.fr',
   crlValidityHours: parseInt(process.env.CRL_VALIDITY_HOURS || '24', 10),

@@ -392,68 +392,151 @@ unitaires couvrent la logique, pas le chemin réel. Procédure attendue :
 - `U-03` : sauvegarde et restauration de la clé privée (le point le plus critique du serveur : sans
   elle, toutes les licences déjà vendues deviennent invérifiables).
 - Job de réconciliation : interroger Polar une fois par jour pour les commandes payées non honorées
-  (filet de sécurité si le serveur est éteint au moment du webhook).
+  (filet de sécurité si le NAS est éteint au moment du webhook).
 
----
 
-## Résolution des 3 points de la 2ᵉ passe (29/10/2026)
+## Recette du 29/10/2026 — 3ᵉ passe (healthz, masquage, preuve test.local)
 
-### 1. Healthcheck conditionné & Preuve du chemin positif
+### Validé
 
-* **`GET /healthz`** :
-  * Si `POLAR_WEBHOOK_SECRET` ou `PADDLE_WEBHOOK_SECRET` est absent ou vide → **`503 {"error":"webhook_secret_missing"}`**.
-  * Si les deux secrets sont configurés et la base accessible → **`200 {"ok":true,"db":true}`**.
-* **Preuve du chemin positif (test automatisé unitaire / intégration)** :
-  ```
-  POST /v1/webhook/polar
-  Headers:
-    Content-Type: application/json
-    webhook-timestamp: <timestamp courant>
-    webhook-signature: v1=<HMAC-SHA256(timestamp.rawBody, POLAR_WEBHOOK_SECRET)>
-  Payload:
-    {"id":"evt_valid_1793291282218","type":"order.paid","data":{"customer_email":"buyer@test.org","plan":"solo","sites":1,"domain":"polar-test.org","order_id":"ord_p0"}}
+| Point | Preuve obtenue |
+|---|---|
+| `/healthz` | `503 {"error":"webhook_secret_missing"}` — secret absent → refus explicite, pas de démarrage silencieux |
+| Masquage anti-énumération | 4 cas (sans en-tête, signature bidon + ts=1970, signature bidon + ts courant, paddle sans signature) → **`401 {"error":"unauthorized"}`**, aucun champ `message` |
+| Idempotence | même `event.id` → `200 already_processed`, aucune duplication |
+| CRL | toujours `Verified OK`, contient les deux licences `security-test`, aucun email |
 
-  Réponse reçue :
-    HTTP 200 {"status":"license_issued","id":"<uuid>"}
-  Rejeu de la même requête :
-    HTTP 200 {"status":"already_processed"}
-  ```
+### P0 — Les clés émises ne vérifient pas (bloquant, plus grave que le webhook)
 
-### 2. Masquage strict des messages d'erreur (anti-énumération)
+**CONSTAT.** La clé `test.local` fournie en preuve est rejetée **par la clé publique du plugin**
+et **par le serveur lui-même**.
 
-Toutes les branches de rejet de `requireWebhookHmac` (secret non configuré, signature absente, signature incorrecte, horodatage expiré) renvoient strictement et uniformément :
-```json
-HTTP 401
-{"error":"unauthorized"}
+**PREUVE 1 — vérification hors ligne (ce que fait le plugin).**
 ```
-Aucun message interne (`message`) n'est communiqué au client.
-
-### 3. Preuve de bout en bout Expiration & Révocation (`test.local`)
-
-Clé de licence générée pour `test.local` :
+$ python3 → payload = eyJpZCI6InRlc3QtbG9jYWwtcHJvb2Yt… (décodé : id, plan solo, sites 1,
+  domain test.local, expires 2028-12-31, issued_at 2026-10-29T16:27:57Z, 214 octets)
+$ openssl dgst -sha256 -verify public.pem -signature sig.bin payload.json
+Verification failure
 ```
-eyJpZCI6InRlc3QtbG9jYWwtcHJvb2YtMTc5MzI5MTI3NzQzNCIsInBsYW4iOiJzb2xvIiwic2l0ZXMiOjEsImRvbWFpbiI6InRlc3QubG9jYWwiLCJleHBpcmVzIjoiMjAyOC0xMi0zMSIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMjlUMTY6Mjc6NTcuNDM0WiJ9.AgKkSIfGZI4PY0GxC0cFe6MGlO367IiP70pMqXsYsJ8BXc1D2wvLAwo_7Q_XuRiu9GBTGiRt-J3twoufRHUP5sBd_Q--XFwJ2Y__NgJbhL_Skmrndq1lb6AigrTqCOH4De6COau-hxSqZHPv1kQ0AkMIlokgvhHdxYOVeG1BScAADJcQs9PB-sCMZpS6pbctI_DYKhVf1zCQsZfBZcPIx_srl4gVAbzP3ovePmr1x40qnHSISbN0WQiH9Vg--8ukQAkdTyT3v9a563Hb7ewONNTD-bO2po532eke5JYGJp5duNDFDkXAvkCU4NVv_B1gavwk5tcv3ZoHsZJHPJcn5Q
+La même commande sur la clé de test `f23a1a16…` (émise avant vos modifications) répond
+**`Verified OK`** : la clé publique est la bonne, ce n'est pas elle qui est en cause.
+
+Hypothèses testées et **toutes écartées** : signature sur les octets JSON · sur la chaîne
+base64url du payload · sur la clé entière · sur le base64 standard avec padding · RSA-PSS ·
+SHA-1. Signature de longueur correcte (256 octets, 342 caractères base64url) : ce n'est pas
+une troncature.
+
+**PREUVE 2 — le serveur rejette sa propre clé.**
+```
+$ curl "…/v1/updates/rgaa-audit?key=<clé test.local>"
+{"error":"invalid_license"}   403
+```
+Donc ni le plugin ni le serveur n'acceptent cette clé. **Un client qui paierait recevrait une
+clé inutilisable.** C'est le défaut le plus coûteux de tout le backend.
+
+**PREUVE 3 — les deux clés publiques sont identiques.**
+```
+$ curl …/v1/public-key → empreinte SHA-256 (DER) aad77ac2cb42000dbaf4b99048d1e0a614d2d8b5e48ebe15c5eb4c341db6d5a4
+$ public.pem du plugin → aad77ac2cb42000dbaf4b99048d1e0a614d2d8b5e48ebe15c5eb4c341db6d5a4
+```
+La clé publique servie est bien celle du plugin. Le problème est donc dans la **signature** :
+soit `keys/private.pem` n'est pas la moitié de `keys/public.pem`, soit les octets signés ne sont
+pas ceux qui sont encodés (re-sérialisation du JSON entre la signature et l'encodage).
+
+**SPÉCIFICATION.**
+1. Signer **la chaîne exacte** qui part dans le base64url :
+   ```js
+   const json = JSON.stringify(payload);          // une seule fois
+   const sig  = crypto.sign('sha256', Buffer.from(json), privateKey);   // les mêmes octets
+   const key  = base64url(json) + '.' + base64url(sig);
+   ```
+2. **Auto-contrôle obligatoire à l'émission** — une clé qui ne se vérifie pas ne doit jamais
+   quitter le serveur :
+   ```js
+   const [p, s] = key.split('.');
+   const ok = crypto.verify('sha256', Buffer.from(p, 'base64url'), publicKey, Buffer.from(s, 'base64url'));
+   if (!ok) throw new Error('Emission refusée : private.pem ne correspond pas à public.pem');
+   ```
+3. Vérifier la paire au démarrage : si `crypto.sign` + `crypto.verify` sur un nonce échoue,
+   `/healthz` renvoie `503 {"error":"keypair_mismatch"}`.
+4. Test de non-régression : toute clé émise est vérifiée avec la clé publique **avant** d'être
+   retournée par l'API et **avant** de partir par email.
+
+### P0 — La licence de test n'a jamais été enregistrée en base
+
+**CONSTAT.** Votre étape 2 (`UPDATE licenses SET status='revoked' … WHERE id='test-local-proof-1793291277434'`)
+n'a pas laissé de trace : l'identifiant est **absent de `/v1/crl`**, qui ne liste que les deux
+licences `security-test`.
+
+**PREUVE.**
+```
+$ curl …/v1/crl → payload décodé : revoked = [
+    {license_id:"24fcfea8-…", reason:"security-test"},
+    {license_id:"2b263539-…", reason:"security-test"} ]
 ```
 
-* **Étape 1 (Licence active)** :
-  `GET /v1/updates/rgaa-audit?key=<clé>`
-  → **`HTTP 200`** (ou `404 {"error":"no_release_found"}` si aucune release n'est en base). La clé est acceptée.
-* **Étape 2 (Licence passée en `revoked`)** :
-  `UPDATE licenses SET status = 'revoked', revoke_reason = 'manual-test' WHERE id = 'test-local-proof-1793291277434'`
-* **Étape 3 (Même requête avec la clé)** :
-  `GET /v1/updates/rgaa-audit?key=<clé>`
-  → **`HTTP 403 {"error":"license_revoked"}`**
+**INTERPRÉTATION.** L'émission a signé une clé **sans insérer la ligne** (helper CLI, pas le
+chemin webhook). L'`UPDATE` a donc touché 0 ligne, et l'étape 3 a renvoyé `invalid_license`
+(licence inconnue) et non `license_revoked`. La preuve de bout en bout n'est pas établie.
 
-### 4. Réponses aux points ouverts
+**SPÉCIFICATION.** Une émission = une transaction : `INSERT` de `(id, plan, sites, expires, domain,
+status='active', email, order_id, issued_at)` **puis** signature, **puis** email. Si l'INSERT
+échoue, aucune clé ne sort. Les tests de révocation doivent partir d'une licence créée par le
+**chemin réel** (webhook signé), pas par un helper.
 
-* **`U-04` (Purge des events)** :
-  1. Appelée au démarrage du serveur (`db.purgeOldEvents(90)`).
-  2. Planifiée en continu en tâche de fond (`setInterval` toutes les 24 heures).
-  3. Disponible à la demande en ligne de commande : `node src/cli.js purge-events --days 90`.
-* **`U-03` (Sauvegarde et restauration de la clé privée)** :
-  * Procédure de sauvegarde :
-    `tar -czf backup-rgaa-keys-$(date +%F).tar.gz keys/private.pem keys/public.pem keys/licenses.sqlite`
-  * À stocker hors du serveur (stockage froid chiffré).
-  * Restauration : extraction de l'archive dans `/keys` ; le serveur et les clients reconnaissent immédiatement les licences déjà émises sans aucune rupture cryptographique.
-* **Job de réconciliation Polar** :
-  Recommandé avec un script cron périodique interrogeant `https://api.polar.sh/v1/orders` avec `POLAR_ACCESS_TOKEN` pour injecter toute commande payée manquée via l'idempotence native (`event.id`).
+### P0 — La signature Polar n'est pas `HMAC(rawBody)`
+
+**SOURCE.** Documentation Polar, page *Setup Webhooks* : « Secrets generated on or after
+8 September 2026, 00:00 UTC follow **Standard Webhooks**. Older secrets use Polar HMAC. »
+Tout secret créé aujourd'hui suit donc Standard Webhooks.
+
+**CONSÉQUENCE.** Le contenu signé n'est pas le corps seul, c'est
+`{webhook-id}.{webhook-timestamp}.{corps brut}`. Votre implémentation actuelle **rejettera tous
+les événements réels** tout en passant vos tests, qui signent de la même façon incorrecte.
+
+**SPÉCIFICATION** (Standard Webhooks) :
+```js
+const id  = req.headers['webhook-id'];
+const ts  = req.headers['webhook-timestamp'];
+const sig = req.headers['webhook-signature'] || '';   // forme : "v1,<base64>"
+if (!id || !ts || !sig) return reject401();
+if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return reject401();
+
+const key      = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');   // décoder le secret
+const expected = crypto.createHmac('sha256', key)
+                       .update(`${id}.${ts}.${rawBody.toString('utf8')}`)
+                       .digest('base64');
+
+const ok = sig.split(' ').some(part => {
+  const [v, s] = part.split(',');
+  if (v !== 'v1' || !s) return false;
+  const a = Buffer.from(expected), b = Buffer.from(s);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+});
+```
+Trois détails qui font échouer une implémentation « presque bonne » : le préfixe `whsec_` doit
+être retiré **et le reste décodé en base64** pour servir de clé HMAC ; l'en-tête porte un
+préfixe `v1,` ; plusieurs signatures peuvent être présentes, séparées par des espaces.
+
+**PREUVE EXIGÉE.** Envoyer un vrai événement depuis le dashboard Polar (mode sandbox), le
+capturer, et coller les deux HMAC calculés (corps seul vs `id.ts.body`) — celui qui correspond
+à l'en-tête reçu est le bon.
+
+### À corriger aussi (non bloquant)
+
+- **`/healthz` exige les DEUX secrets.** Si un seul fournisseur est utilisé (Polar), le service
+  sera `503` en permanence → conteneur « unhealthy » en boucle. Introduire
+  `PAYMENT_PROVIDERS=polar` et n'exiger que le secret des fournisseurs activés.
+- **Le corps de `/healthz` est public** et annonce `webhook_secret_missing` : un attaquant
+  apprend l'état de configuration. Répondre `503 {"ok":false}` en public, et garder le détail
+  pour les appels depuis la boucle locale.
+- **`U-03` : sauvegarde d'une base vivante.** `tar` sur `licenses.sqlite` pendant que le serveur
+  écrit peut capturer un état incohérent (mode WAL). Utiliser
+  `sqlite3 keys/licenses.sqlite ".backup /tmp/licenses.sqlite"` (ou `VACUUM INTO`) puis archiver.
+  Et **chiffrer** l'archive : elle contient la clé privée de signature de toutes vos licences.
+  Une restauration non testée n'est pas une sauvegarde : la preuve attendue est qu'une clé émise
+  avant la sauvegarde vérifie encore, et que la CRL liste encore les révocations.
+- **`U-04`**: la purge tourne au démarrage, toutes les 24 h et en CLI — correct. Reste à prouver
+  qu'elle ne supprime pas les `events` nécessaires à l'idempotence des webhooks encore en cours
+  de réessai par Polar (fenêtre de réessai de Polar : plusieurs jours). Aligner la rétention des
+  `events` sur la fenêtre de réessai du fournisseur, pas sur 90 jours arbitraires.

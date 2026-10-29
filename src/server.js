@@ -10,7 +10,8 @@ const {
   signEnvelope,
   verifyLicenseKey,
   getPublicKey,
-  initKeypair
+  initKeypair,
+  checkKeypair
 } = require('./crypto');
 const { sendLicenseEmail } = require('./mailer');
 
@@ -313,11 +314,35 @@ app.get('/api/shared', (req, res) => {
 // Healthcheck (§8 Ops & Recette)
 app.get('/healthz', (req, res) => {
   try {
+    const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
+
+    // 1. Keypair consistency self-check
+    if (!checkKeypair()) {
+      if (isLocal) {
+        return res.status(503).json({ ok: false, error: 'keypair_mismatch' });
+      }
+      return res.status(503).json({ ok: false });
+    }
+
+    // 2. Database connectivity
     const row = db.getDb().prepare('SELECT 1 as ok').get();
     const isDbOk = Boolean(row && row.ok === 1);
 
-    if (!config.polarWebhookSecret || !config.paddleWebhookSecret) {
-      return res.status(503).json({ error: 'webhook_secret_missing' });
+    // 3. Webhook secrets for enabled payment providers (config.paymentProviders)
+    const activeProviders = config.paymentProviders;
+    const missing = [];
+    if (activeProviders.includes('polar') && !config.polarWebhookSecret) {
+      missing.push('POLAR_WEBHOOK_SECRET');
+    }
+    if (activeProviders.includes('paddle') && !config.paddleWebhookSecret) {
+      missing.push('PADDLE_WEBHOOK_SECRET');
+    }
+
+    if (missing.length > 0) {
+      if (isLocal) {
+        return res.status(503).json({ ok: false, error: 'webhook_secret_missing', missing });
+      }
+      return res.status(503).json({ ok: false });
     }
 
     res.json({ ok: true, db: isDbOk });
@@ -528,109 +553,108 @@ app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
    Webhooks Polar & Paddle (P0 & U-01)
 ---------------------------------------------------- */
 
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// Standard Webhooks verification for Polar (P0 Specification)
+function verifyPolarWebhook(req, secret) {
+  if (!secret) return false;
+
+  const id = req.headers['webhook-id'];
+  const ts = req.headers['webhook-timestamp'];
+  const sig = req.headers['webhook-signature'] || req.headers['polar-webhook-signature'] || '';
+
+  if (!id || !ts || !sig) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+
+  const rawBuf = (req.rawBody && Buffer.isBuffer(req.rawBody))
+    ? req.rawBody
+    : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
+
+  // Decode secret: strip whsec_ prefix if present and decode base64
+  let keyBuf;
+  if (secret.startsWith('whsec_')) {
+    keyBuf = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
+  } else {
+    try {
+      const b64 = Buffer.from(secret, 'base64');
+      keyBuf = b64.length > 0 ? b64 : Buffer.from(secret, 'utf8');
+    } catch {
+      keyBuf = Buffer.from(secret, 'utf8');
+    }
+  }
+
+  // Content to sign: {id}.{ts}.{rawBody}
+  const toSignBuf = Buffer.concat([Buffer.from(`${id}.${ts}.`), rawBuf]);
+  const expectedBase64 = crypto.createHmac('sha256', keyBuf).update(toSignBuf).digest('base64');
+  const expectedUtf8Base64 = crypto.createHmac('sha256', Buffer.from(secret, 'utf8')).update(toSignBuf).digest('base64');
+  const expectedHex = crypto.createHmac('sha256', keyBuf).update(toSignBuf).digest('hex');
+
+  const parts = sig.split(' ');
+  return parts.some(part => {
+    let [v, s] = part.split(',');
+    if (!s) {
+      s = v;
+      v = 'v1';
+    }
+    if (!s) return false;
+
+    return (
+      safeCompare(s, expectedBase64) ||
+      safeCompare(s, expectedUtf8Base64) ||
+      safeCompare(s, expectedHex)
+    );
+  });
+}
+
+// Paddle HMAC verification
+function verifyPaddleWebhook(req, secret) {
+  if (!secret) return false;
+
+  const hPaddleSig = req.headers['paddle-signature'];
+  if (!hPaddleSig) return false;
+
+  let ts = null;
+  let hash = null;
+
+  const parts = hPaddleSig.split(';');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith('ts=')) {
+      ts = trimmed.slice(3);
+    } else if (trimmed.startsWith('h1=')) {
+      hash = trimmed.slice(3);
+    }
+  }
+
+  if (!ts || !hash) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+
+  const rawBuf = (req.rawBody && Buffer.isBuffer(req.rawBody))
+    ? req.rawBody
+    : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
+
+  const toSignBuf = Buffer.concat([Buffer.from(`${ts}:`), rawBuf]);
+  const expectedHex = crypto.createHmac('sha256', secret).update(toSignBuf).digest('hex');
+
+  return safeCompare(hash, expectedHex);
+}
+
 function requireWebhookHmac(provider) {
   return (req, res, next) => {
-    const secret = provider === 'polar' ? config.polarWebhookSecret : config.paddleWebhookSecret;
-    if (!secret) {
-      return res.status(401).json({ error: 'unauthorized' });
+    let isValid = false;
+    if (provider === 'polar') {
+      isValid = verifyPolarWebhook(req, config.polarWebhookSecret);
+    } else if (provider === 'paddle') {
+      isValid = verifyPaddleWebhook(req, config.paddleWebhookSecret);
     }
 
-    let timestamp = null;
-    const signatureCandidates = [];
-
-    // Paddle signature header: ts=12345;h1=abcd
-    const hPaddleSig = req.headers['paddle-signature'];
-    if (hPaddleSig) {
-      const parts = hPaddleSig.split(';');
-      for (const part of parts) {
-        const trimmed = part.trim();
-        if (trimmed.startsWith('ts=')) {
-          timestamp = parseInt(trimmed.slice(3), 10);
-        } else if (trimmed.startsWith('h1=') || trimmed.startsWith('v1=')) {
-          signatureCandidates.push(trimmed.slice(3));
-        }
-      }
-    }
-
-    // Polar / Standard Webhook headers
-    const hWebhookTimestamp = req.headers['webhook-timestamp'] || req.headers['x-webhook-timestamp'];
-    if (hWebhookTimestamp) {
-      const parsed = parseInt(hWebhookTimestamp, 10);
-      if (!isNaN(parsed)) {
-        timestamp = parsed;
-      }
-    }
-
-    const hWebhookSig = req.headers['webhook-signature'] || req.headers['polar-webhook-signature'];
-    if (hWebhookSig) {
-      const entries = hWebhookSig.split(/[,;\s]+/);
-      for (const entry of entries) {
-        const trimmed = entry.trim();
-        if (!trimmed) continue;
-        if (trimmed.startsWith('t=')) {
-          if (!timestamp) {
-            timestamp = parseInt(trimmed.slice(2), 10);
-          }
-        } else if (trimmed.startsWith('v1=') || trimmed.startsWith('h1=')) {
-          signatureCandidates.push(trimmed.slice(3));
-        } else if (trimmed.startsWith('v1,')) {
-          signatureCandidates.push(trimmed.slice(3));
-        } else {
-          signatureCandidates.push(trimmed);
-        }
-      }
-    }
-
-    // 1. Missing headers -> 401
-    if (!timestamp || isNaN(timestamp) || signatureCandidates.length === 0) {
-      return res.status(401).json({ error: 'unauthorized' });
-    }
-
-    // 2. Reject if |now - timestamp| > 300 s -> 401
-    const now = Math.floor(Date.now() / 1000);
-    if (Math.abs(now - timestamp) > 300) {
-      return res.status(401).json({ error: 'unauthorized' });
-    }
-
-    // 3. HMAC-SHA256 calculated on raw body bytes (req.rawBody)
-    const rawBuf = (req.rawBody && Buffer.isBuffer(req.rawBody))
-      ? req.rawBody
-      : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
-
-    const msgId = req.headers['webhook-id'];
-    const payloadPrefixes = [
-      Buffer.from(`${timestamp}.`),
-      Buffer.from(`${timestamp}:`)
-    ];
-    if (msgId) {
-      payloadPrefixes.push(Buffer.from(`${msgId}.${timestamp}.`));
-    }
-
-    const validSignatures = new Set();
-    for (const prefix of payloadPrefixes) {
-      const payloadBuf = Buffer.concat([prefix, rawBuf]);
-      const hex = crypto.createHmac('sha256', secret).update(payloadBuf).digest('hex');
-      const base64 = crypto.createHmac('sha256', secret).update(payloadBuf).digest('base64');
-      validSignatures.add(hex);
-      validSignatures.add(base64);
-    }
-
-    let matched = false;
-    for (const cand of signatureCandidates) {
-      for (const validSig of validSignatures) {
-        if (typeof cand === 'string' && cand.length === validSig.length) {
-          try {
-            if (crypto.timingSafeEqual(Buffer.from(cand), Buffer.from(validSig))) {
-              matched = true;
-              break;
-            }
-          } catch {}
-        }
-      }
-      if (matched) break;
-    }
-
-    if (!matched) {
+    if (!isValid) {
       return res.status(401).json({ error: 'unauthorized' });
     }
 
@@ -663,18 +687,9 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       const expiresDate = new Date();
       expiresDate.setFullYear(expiresDate.getFullYear() + 1);
       const expires = expiresDate.toISOString().split('T')[0];
+      const nowIso = new Date().toISOString();
 
-      const payload = {
-        id: licenseId,
-        plan,
-        sites,
-        expires,
-        domain: normalizeDomain(domain),
-        issued_at: new Date().toISOString()
-      };
-
-      const signed = signLicense(payload);
-
+      // 1. Transactional insertion: INSERT first
       db.createLicense({
         id: licenseId,
         email,
@@ -685,9 +700,24 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         provider: 'polar',
         provider_ref: data.subscription_id || data.order_id || event.id,
         status: 'active',
-        signed_key: signed.key
+        created_at: nowIso
       });
 
+      // 2. Sign key (auto-control verification against public key)
+      const payload = {
+        id: licenseId,
+        plan,
+        sites,
+        expires,
+        domain: normalizeDomain(domain),
+        issued_at: nowIso
+      };
+      const signed = signLicense(payload);
+
+      // 3. Store signed_key in DB
+      db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
+
+      // 4. Send email
       sendLicenseEmail({
         to: email,
         plan,
@@ -696,7 +726,7 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         key: signed.key
       }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
 
-      return res.status(200).json({ status: 'license_issued', id: licenseId });
+      return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
     }
 
     if (event.type === 'subscription.cancelled' || event.type === 'order.refunded') {
@@ -746,17 +776,7 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
       const expiresDate = new Date();
       expiresDate.setFullYear(expiresDate.getFullYear() + 1);
       const expires = expiresDate.toISOString().split('T')[0];
-
-      const payload = {
-        id: licenseId,
-        plan,
-        sites,
-        expires,
-        domain: normalizeDomain(domain),
-        issued_at: new Date().toISOString()
-      };
-
-      const signed = signLicense(payload);
+      const nowIso = new Date().toISOString();
 
       db.createLicense({
         id: licenseId,
@@ -768,8 +788,20 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
         provider: 'paddle',
         provider_ref: data.subscription_id || data.id || eventId,
         status: 'active',
-        signed_key: signed.key
+        created_at: nowIso
       });
+
+      const payload = {
+        id: licenseId,
+        plan,
+        sites,
+        expires,
+        domain: normalizeDomain(domain),
+        issued_at: nowIso
+      };
+      const signed = signLicense(payload);
+
+      db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
 
       sendLicenseEmail({
         to: email,
@@ -779,7 +811,7 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
         key: signed.key
       }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
 
-      return res.status(200).json({ status: 'license_issued', id: licenseId });
+      return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
     }
 
     if (eventType === 'subscription.canceled' || eventType === 'adjustment.created') {
@@ -919,9 +951,13 @@ app.use((err, req, res, next) => {
 // Start server if run directly
 if (require.main === module) {
   initKeypair();
+  if (!checkKeypair()) {
+    console.error('[FATAL] RSA keypair mismatch: private.pem does not match public.pem!');
+    process.exit(1);
+  }
   db.getDb();
   try {
-    db.purgeOldEvents(90);
+    db.purgeOldEvents(config.eventsRetentionDays);
     db.revokeSecurityTestLicenses();
   } catch {}
 
