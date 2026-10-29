@@ -11,9 +11,29 @@ const {
   verifyLicenseKey,
   getPublicKey,
   initKeypair,
-  checkKeypair
+  checkKeypair,
+  sha256File
 } = require('./crypto');
 const { sendLicenseEmail, getMailHealth, getLastMailError } = require('./mailer');
+const { inspectPluginZip } = require('./zip');
+
+// Manifest cache & helper for downloads (M-03 & M-04)
+const manifestCache = new Map();
+
+function invalidateManifestCache() {
+  manifestCache.clear();
+}
+
+function buildDownloadUrl(key) {
+  const release = db.getLatestRelease();
+  if (!release) return null;
+
+  const base = release.download_url
+    ? release.download_url.replace(/\?.*$/, '')
+    : `${config.publicBaseUrl}/v1/download/${release.version}.zip`;
+
+  return key ? `${base}?key=${encodeURIComponent(key)}` : base;
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -453,6 +473,145 @@ app.post('/api/licenses/purge', (req, res) => {
   }
 });
 
+// Upload release zip binary (M-03)
+app.post(
+  '/api/releases',
+  express.raw({ type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'], limit: '50mb' }),
+  async (req, res) => {
+    if (!checkAdminToken(req)) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    try {
+      const version = req.query.version || req.headers['x-release-version'];
+      const requires = req.query.requires || req.headers['x-release-requires'] || '6.5';
+      const tested = req.query.tested || req.headers['x-release-tested'] || '6.8';
+      const requiresPhp = req.query.requires_php || req.query['requires-php'] || req.headers['x-release-requires-php'] || '8.1';
+      const changelog = req.query.changelog || req.headers['x-release-changelog'] || '';
+
+      // 1. Verify semver format
+      if (!version || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
+        return res.status(400).json({ error: 'invalid_version', message: 'version must follow semver format X.Y.Z' });
+      }
+
+      // Check payload buffer
+      if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: 'missing_zip_file', message: 'ZIP archive payload is required' });
+      }
+
+      // 2. Open ZIP in memory and inspect rgaa-audit/rgaa-audit.php
+      const inspection = inspectPluginZip(req.body);
+      if (!inspection.valid) {
+        return res.status(422).json({ error: inspection.error, message: inspection.message });
+      }
+
+      if (inspection.zipVersion !== version) {
+        return res.status(422).json({
+          error: 'version_mismatch',
+          zip_version: inspection.zipVersion,
+          declared: version
+        });
+      }
+
+      // 3. Write ZIP file to <KEYS_DIR>/releases/rgaa-audit-<version>.zip
+      const releasesDir = config.releasesDir;
+      if (!fs.existsSync(releasesDir)) {
+        fs.mkdirSync(releasesDir, { recursive: true, mode: 0o755 });
+      }
+      const targetPath = path.join(releasesDir, `rgaa-audit-${version}.zip`);
+      fs.writeFileSync(targetPath, req.body);
+
+      // 4. Calculate SHA-256 of the file written on disk
+      const sha256 = sha256File(targetPath);
+      const size = fs.statSync(targetPath).size;
+
+      // 5. Create release record in DB
+      db.createRelease({
+        version,
+        zip_path: path.resolve(targetPath),
+        sha256,
+        requires,
+        tested,
+        requires_php: requiresPhp,
+        changelog,
+        published_at: new Date().toISOString()
+      });
+
+      // 6. Invalidate manifest cache
+      invalidateManifestCache();
+
+      // 7. Return 201
+      res.status(201).json({
+        version,
+        sha256,
+        size
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// List releases (M-03)
+app.get('/api/releases', (req, res) => {
+  if (!checkAdminToken(req)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  try {
+    const rawList = db.listReleases();
+    const releases = rawList.map(r => ({
+      version: r.version,
+      sha256: r.sha256,
+      size: fs.existsSync(r.zip_path) ? fs.statSync(r.zip_path).size : 0,
+      published_at: r.published_at,
+      download_count: r.download_count || 0,
+      zip_path: r.zip_path,
+      requires: r.requires,
+      tested: r.tested,
+      requires_php: r.requires_php,
+      changelog: r.changelog
+    }));
+    res.json({ releases });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete release (M-03)
+app.delete('/api/releases/:version', (req, res) => {
+  if (!checkAdminToken(req)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  try {
+    const { version } = req.params;
+    const rel = db.getRelease(version);
+    if (!rel) {
+      return res.status(404).json({ error: 'release_not_found' });
+    }
+
+    const latest = db.getLatestRelease();
+    if (latest && latest.version === version) {
+      return res.status(409).json({ error: 'cannot_delete_latest', message: 'Cannot delete the latest release' });
+    }
+
+    if (fs.existsSync(rel.zip_path)) {
+      try {
+        fs.unlinkSync(rel.zip_path);
+      } catch (e) {
+        console.error(`[release] Failed to delete file ${rel.zip_path}: ${e.message}`);
+      }
+    }
+
+    db.deleteRelease(version);
+    invalidateManifestCache();
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Shared licenses for dashboard alerts
 app.get('/api/shared', (req, res) => {
   try {
@@ -660,12 +819,17 @@ app.post('/v1/resend-key', async (req, res) => {
     return res.status(404).json({ error: 'license_not_found' });
   }
 
+  const latestRel = db.getLatestRelease();
+  const dlUrl = buildDownloadUrl(lic.signed_key);
+
   const mailResult = await sendLicenseEmail({
     to: lic.email,
     plan: lic.plan,
     domain: lic.domain,
     expires: lic.expires_at,
-    key: lic.signed_key
+    key: lic.signed_key,
+    downloadUrl: dlUrl,
+    version: latestRel?.version
   });
 
   if (mailResult && mailResult.success) {
@@ -741,12 +905,12 @@ app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
     return res.status(404).json({ error: 'no_release_found' });
   }
 
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-  const host = req.get('host');
-  let downloadUrl = release.download_url || `${protocol}://${host}/v1/download/${release.version}.zip`;
-  if (key) {
-    downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + `key=${encodeURIComponent(key)}`;
+  const cacheKey = `${slug}:${key || ''}`;
+  if (manifestCache.has(cacheKey)) {
+    return res.json(manifestCache.get(cacheKey));
   }
+
+  const downloadUrl = buildDownloadUrl(key);
 
   const manifest = {
     slug,
@@ -761,6 +925,7 @@ app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
   };
 
   const signed = signEnvelope(manifest);
+  manifestCache.set(cacheKey, signed);
   res.json(signed);
 });
 
@@ -806,6 +971,7 @@ app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
     return res.status(404).json({ error: 'release_not_found' });
   }
 
+  db.incrementReleaseDownloads(version);
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('ETag', `"${release.sha256}"`);
   res.sendFile(path.resolve(release.zip_path));
@@ -983,12 +1149,16 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       db.updateLicenseExpires(lic.id, newExpires, signed.key);
 
       // Send renewal email to client
+      const latestRel = db.getLatestRelease();
+      const dlUrl = buildDownloadUrl(signed.key);
       const mailResult = await sendLicenseEmail({
         to: lic.email,
         plan: lic.plan,
         domain: lic.domain,
         expires: newExpires,
         key: signed.key,
+        downloadUrl: dlUrl,
+        version: latestRel?.version,
         isRenewal: true
       });
       if (mailResult && mailResult.success) {
@@ -1017,12 +1187,16 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
           return res.status(200).json({ status: 'already_processed', id: existingLic.id });
         }
         // Exists with emailed_at null -> retry sending email
+        const latestRel = db.getLatestRelease();
+        const dlUrl = buildDownloadUrl(existingLic.signed_key);
         const mailResult = await sendLicenseEmail({
           to: existingLic.email,
           plan: existingLic.plan,
           domain: existingLic.domain,
           expires: existingLic.expires_at,
-          key: existingLic.signed_key
+          key: existingLic.signed_key,
+          downloadUrl: dlUrl,
+          version: latestRel?.version
         });
         if (mailResult && mailResult.success) {
           db.updateLicenseMailStatus(existingLic.id, { success: true });
@@ -1095,12 +1269,16 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       });
 
       // Send email (strict delivery check)
+      const latestRel = db.getLatestRelease();
+      const dlUrl = buildDownloadUrl(signed.key);
       const mailResult = await sendLicenseEmail({
         to: email,
         plan,
         domain,
         expires,
-        key: signed.key
+        key: signed.key,
+        downloadUrl: dlUrl,
+        version: latestRel?.version
       });
 
       if (mailResult && mailResult.success) {
@@ -1205,12 +1383,16 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
 
       db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
 
+      const latestRel = db.getLatestRelease();
+      const dlUrl = buildDownloadUrl(signed.key);
       const mailResult = await sendLicenseEmail({
         to: email,
         plan,
         domain,
         expires,
-        key: signed.key
+        key: signed.key,
+        downloadUrl: dlUrl,
+        version: latestRel?.version
       });
 
       if (mailResult && mailResult.success) {
@@ -1390,4 +1572,6 @@ app.resetRateLimits = () => {
 
 module.exports = app;
 module.exports.invalidateCrlCache = invalidateCrlCache;
+module.exports.invalidateManifestCache = invalidateManifestCache;
+module.exports.buildDownloadUrl = buildDownloadUrl;
 module.exports.resetRateLimits = app.resetRateLimits;

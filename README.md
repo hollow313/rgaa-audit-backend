@@ -212,11 +212,17 @@ docker exec -it rgaa-license-server node src/cli.js publish \
 | `GET` | `/v1/crl` | Liste de révocation signée (`Cache-Control: 3600`) |
 | `GET` | `/v1/updates` / `/:slug` | Manifeste de mise à jour signé (exige `?key=...`) |
 | `GET` | `/v1/download/:version.zip?key=…` | Téléchargement du ZIP après validation de la clé |
+| `POST` | `/v1/resend-key` | Renvoi de l'email avec la clé de licence (exige `ADMIN_TOKEN`) |
 | `POST` | `/v1/webhook/polar` | Webhook Standard Webhooks Polar pour émission automatique |
 | `POST` | `/v1/webhook/paddle` | Webhook des commandes Paddle |
 | `GET` | `/api/licenses` | Liste des licences avec activations et clés (exige `ADMIN_TOKEN`) |
 | `POST` | `/api/licenses` | Création transactionnelle de licence (exige `ADMIN_TOKEN`) |
 | `POST` | `/api/licenses/:id/revoke` | Révocation immédiate d'une licence (exige `ADMIN_TOKEN`) |
+| `DELETE` | `/api/licenses/:id` | Suppression définitive d'une licence et de ses activations (exige `ADMIN_TOKEN`) |
+| `POST` | `/api/licenses/purge` | Purge ciblée des licences de test ou révoquées (exige `ADMIN_TOKEN`) |
+| `GET` | `/api/releases` | Liste des versions publiées du plugin avec SHA-256 et métriques (exige `ADMIN_TOKEN`) |
+| `POST` | `/api/releases` | Publication directe d'une archive ZIP du plugin avec contrôle d'intégrité (exige `ADMIN_TOKEN`) |
+| `DELETE` | `/api/releases/:version` | Suppression d'une version publiée (refuse la dernière version active, exige `ADMIN_TOKEN`) |
 | `GET` | `/api/stats` | Métriques et statistiques du parc de licences |
 
 ---

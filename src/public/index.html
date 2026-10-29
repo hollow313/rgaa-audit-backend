@@ -382,6 +382,7 @@
     <div class="tabs">
       <button class="tab-btn active" id="tab-btn-licenses" onclick="switchTab('licenses')">Toutes les licences</button>
       <button class="tab-btn" id="tab-btn-shared" onclick="switchTab('shared')">Alertes de partage (<span id="shared-count">0</span>)</button>
+      <button class="tab-btn" id="tab-btn-releases" onclick="switchTab('releases')">📦 Mises à jour (<span id="releases-count">0</span>)</button>
     </div>
 
     <!-- Table Licences -->
@@ -432,6 +433,69 @@
           </thead>
           <tbody id="shared-tbody">
             <tr><td colspan="6" class="empty-state">Chargement...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Onglet Mises à jour (M-03) -->
+    <div id="tab-releases" class="card" style="display: none;">
+      <div class="card-title">
+        <span>Publier une nouvelle version du plugin</span>
+      </div>
+      
+      <form id="release-publish-form" onsubmit="handlePublishRelease(event)" style="margin-top: 1rem;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+          <div class="form-group">
+            <label>Fichier ZIP (.zip)*</label>
+            <input type="file" id="release-file-input" accept=".zip" onchange="handleReleaseFileSelect(this)" required style="padding: 0.45rem;">
+          </div>
+          <div class="form-group">
+            <label>Version déclarée (ex: 0.2.3)*</label>
+            <input type="text" id="release-version" placeholder="0.2.3" required>
+          </div>
+          <div class="form-group">
+            <label>WordPress min. (requires)</label>
+            <input type="text" id="release-requires" value="6.5">
+          </div>
+          <div class="form-group">
+            <label>WordPress max. (tested)</label>
+            <input type="text" id="release-tested" value="6.8">
+          </div>
+          <div class="form-group">
+            <label>PHP min. (requires_php)</label>
+            <input type="text" id="release-requires-php" value="8.1">
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 1rem;">
+          <label>Notes de version (Changelog)</label>
+          <textarea id="release-changelog" placeholder="Ex: Correction bug détection RGAA, compatibilité WP 6.8..." rows="3"></textarea>
+        </div>
+
+        <button type="submit" class="btn-primary" id="publish-release-btn">🚀 Publier la version</button>
+        <div id="release-upload-feedback"></div>
+      </form>
+
+      <hr style="border: none; border-top: 1px solid var(--border); margin: 2rem 0;">
+
+      <div class="card-title">
+        <span>Historique des versions publiées</span>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Date de publication</th>
+              <th>Taille</th>
+              <th>Téléchargements</th>
+              <th>Empreinte SHA-256 (contrôle d'intégrité)</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="releases-tbody">
+            <tr><td colspan="6" class="empty-state">Chargement des versions...</td></tr>
           </tbody>
         </table>
       </div>
@@ -621,10 +685,11 @@
       }
 
       try {
-        const [licRes, statsRes, sharedRes] = await Promise.all([
+        const [licRes, statsRes, sharedRes, relRes] = await Promise.all([
           fetchWithAuth('/api/licenses'),
           fetchWithAuth('/api/stats'),
-          fetchWithAuth('/api/shared')
+          fetchWithAuth('/api/shared'),
+          fetchWithAuth('/api/releases').catch(() => null)
         ]);
 
         allLicenses = await licRes.json();
@@ -642,6 +707,11 @@
 
         renderLicenses(allLicenses);
         renderShared(shared);
+
+        if (relRes && relRes.ok) {
+          const relData = await relRes.json();
+          renderReleases(relData.releases || []);
+        }
       } catch (err) {
         console.error('Error loading data:', err);
       }
@@ -857,7 +927,7 @@
           body: JSON.stringify({
             key: key,
             domain: domain,
-            plugin_version: '0.2.0'
+            plugin_version: (window.latestReleaseVersion || '1.0.0')
           })
         });
 
@@ -1067,11 +1137,191 @@
       setTimeout(() => { toast.style.display = 'none'; }, 2500);
     }
 
+    function renderReleases(releases) {
+      const tbody = document.getElementById('releases-tbody');
+      const countEl = document.getElementById('releases-count');
+      if (countEl) countEl.textContent = releases ? releases.length : 0;
+
+      if (!releases || releases.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Aucune version publiée pour le moment.</td></tr>';
+        window.latestReleaseVersion = null;
+        return;
+      }
+
+      window.latestReleaseVersion = releases[0].version;
+
+      tbody.innerHTML = releases.map((r, index) => {
+        const isLatest = index === 0;
+        const sizeFormatted = r.size ? (r.size / 1024).toFixed(1) + ' Ko' : 'N/A';
+        const dateFormatted = r.published_at ? new Date(r.published_at).toLocaleString('fr-FR') : '-';
+
+        return `
+          <tr>
+            <td>
+              <strong style="color: #fff; font-size: 0.95rem;">${escapeHtml(r.version)}</strong>
+              ${isLatest ? '<span class="badge badge-success" style="margin-left: 0.4rem;">Dernière</span>' : ''}
+            </td>
+            <td>${dateFormatted}</td>
+            <td>${sizeFormatted}</td>
+            <td><span class="badge badge-active">${r.download_count || 0}</span></td>
+            <td>
+              <code style="display: block; font-size: 0.72rem; word-break: break-all; color: var(--accent); background: #0f172a; padding: 4px 6px; border-radius: 4px;">${escapeHtml(r.sha256)}</code>
+            </td>
+            <td>
+              <button 
+                onclick="handleDeleteRelease('${escapeHtml(r.version)}')" 
+                class="btn-danger btn-sm"
+                title="${isLatest ? 'Impossible de supprimer la dernière version' : 'Supprimer cette version'}"
+                ${isLatest ? 'disabled style="opacity: 0.4; cursor: not-allowed;"' : ''}
+              >
+                🗑️ Supprimer
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function handleReleaseFileSelect(input) {
+      const file = input.files[0];
+      if (!file) return;
+
+      const match = file.name.match(/(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)/);
+      if (match) {
+        document.getElementById('release-version').value = match[1];
+      }
+
+      const feedback = document.getElementById('release-upload-feedback');
+      feedback.innerHTML = '<div style="font-size:0.8125rem; color:var(--text-muted); margin-top:0.5rem;">Calcul du SHA-256 local en cours...</div>';
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const localSha256 = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        window._selectedFileSha256 = localSha256;
+
+        feedback.innerHTML = `
+          <div style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.5rem;">
+            Fichier : <strong>${escapeHtml(file.name)}</strong> (${(file.size / 1024).toFixed(1)} Ko)<br>
+            SHA-256 local pré-calculé : <code style="font-size: 0.72rem; word-break: break-all; color: var(--accent);">${localSha256}</code>
+          </div>
+        `;
+      } catch (err) {
+        feedback.innerHTML = `<div style="color:var(--danger); font-size:0.8125rem;">Erreur de calcul du SHA-256 local : ${err.message}</div>`;
+      }
+    }
+
+    async function handlePublishRelease(event) {
+      if (event) event.preventDefault();
+      const fileInput = document.getElementById('release-file-input');
+      const file = fileInput.files[0];
+      if (!file) {
+        alert('Veuillez sélectionner un fichier .zip');
+        return;
+      }
+
+      const version = document.getElementById('release-version').value.trim();
+      const requires = document.getElementById('release-requires').value.trim() || '6.5';
+      const tested = document.getElementById('release-tested').value.trim() || '6.8';
+      const requiresPhp = document.getElementById('release-requires-php').value.trim() || '8.1';
+      const changelog = document.getElementById('release-changelog').value.trim();
+
+      if (!version) {
+        alert('La version est obligatoire (ex: 0.2.3)');
+        return;
+      }
+
+      const btn = document.getElementById('publish-release-btn');
+      btn.disabled = true;
+      btn.textContent = 'Publication en cours...';
+
+      try {
+        const query = new URLSearchParams({
+          version,
+          requires,
+          tested,
+          requires_php: requiresPhp,
+          changelog
+        });
+
+        const res = await fetchWithAuth(`/api/releases?${query.toString()}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/zip'
+          },
+          body: file
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          if (res.status === 422 && data.error === 'version_mismatch') {
+            alert(`Erreur 422 (version mismatch) : La version déclarée (${data.declared}) ne correspond pas à la version dans rgaa-audit.php (${data.zip_version}) !`);
+          } else {
+            alert(`Erreur (${res.status}) : ${data.error || data.message || 'Échec de publication'}`);
+          }
+          return;
+        }
+
+        const localSha = window._selectedFileSha256;
+        const matchSuccess = localSha && localSha.toLowerCase() === data.sha256.toLowerCase();
+
+        document.getElementById('release-upload-feedback').innerHTML = `
+          <div style="background: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34, 197, 94, 0.4); border-radius: 6px; padding: 12px; margin-top: 10px; color: #4ade80; font-size: 0.85rem;">
+            <strong>✅ Version ${escapeHtml(data.version)} publiée avec succès !</strong><br>
+            SHA-256 serveur : <code style="font-size: 0.72rem; word-break: break-all;">${data.sha256}</code><br>
+            SHA-256 local : <code style="font-size: 0.72rem; word-break: break-all;">${localSha || 'N/A'}</code><br>
+            ${matchSuccess ? '🎉 <strong>Vérification d\'intégrité réussie :</strong> les empreintes SHA-256 correspondent exactement !' : ''}
+          </div>
+        `;
+
+        showToast(`✅ Version ${data.version} publiée !`);
+        fileInput.value = '';
+        document.getElementById('release-changelog').value = '';
+        await loadData();
+      } catch (err) {
+        alert(`Erreur : ${err.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🚀 Publier la version';
+      }
+    }
+
+    async function handleDeleteRelease(version) {
+      if (!confirm(`Supprimer la version ${version} ? Cette action est irréversible.`)) {
+        return;
+      }
+
+      try {
+        const res = await fetchWithAuth(`/api/releases/${encodeURIComponent(version)}`, {
+          method: 'DELETE'
+        });
+
+        if (res.status === 409) {
+          alert(`Impossible de supprimer la version ${version} : c'est la version la plus récente (409 cannot_delete_latest).`);
+          return;
+        }
+
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          alert(`Erreur (${res.status}) : ${data.error || 'Échec de la suppression'}`);
+          return;
+        }
+
+        showToast(`🗑️ Version ${version} supprimée`);
+        await loadData();
+      } catch (err) {
+        alert(`Erreur : ${err.message}`);
+      }
+    }
+
     function switchTab(tab) {
       document.getElementById('tab-licenses').style.display = tab === 'licenses' ? 'block' : 'none';
       document.getElementById('tab-shared').style.display = tab === 'shared' ? 'block' : 'none';
+      document.getElementById('tab-releases').style.display = tab === 'releases' ? 'block' : 'none';
       document.getElementById('tab-btn-licenses').className = 'tab-btn' + (tab === 'licenses' ? ' active' : '');
       document.getElementById('tab-btn-shared').className = 'tab-btn' + (tab === 'shared' ? ' active' : '');
+      document.getElementById('tab-btn-releases').className = 'tab-btn' + (tab === 'releases' ? ' active' : '');
     }
 
     function escapeHtml(str) {

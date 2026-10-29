@@ -41,7 +41,7 @@ function getLastMailError() {
   return lastMailError;
 }
 
-async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = null, isRenewal = false }) {
+async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = null, version = null, isRenewal = false }) {
   const mailer = getTransporter();
   if (!mailer) {
     const msg = 'SMTP_URL or SMTP_FROM not configured';
@@ -49,12 +49,14 @@ async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = 
     return { success: false, ok: false, error: 'smtp_not_configured' };
   }
 
-  const base = config.publicBaseUrl || 'https://updates.rgaa-audit.eu';
-  const dlLink = downloadUrl || `${base}/v1/download/0.2.0.zip?key=${encodeURIComponent(key)}`;
   const subject = isRenewal ? 'Renouvellement de votre licence RGAA Audit' : 'Votre clé de licence RGAA Audit';
   const intro = isRenewal
     ? 'Votre abonnement a été renouvelé avec succès ! Voici votre nouvelle clé de licence mise à jour :'
     : 'Merci pour votre commande !\n\nVoici votre clé de licence pour RGAA Audit :';
+
+  const downloadBlockText = downloadUrl
+    ? `\nTéléchargement de l'extension :\n${downloadUrl}\n`
+    : '';
 
   const text = `Bonjour,
 
@@ -65,16 +67,28 @@ Détails de la licence :
 - Plan : ${plan}
 - Domaine associé : ${domain}
 - Date d'expiration : ${expires}
-
-Téléchargement de l'extension :
-${dlLink}
-
+${downloadBlockText}
 Pour l'activer, rendez-vous dans l'administration WordPress de votre site :
 RGAA Audit > Réglages > Clé de licence.
 
 Bien cordialement,
 L'équipe RGAA Audit
 `;
+
+  const downloadButtonLabel = version
+    ? `Télécharger la version ${version} (.zip)`
+    : 'Télécharger le plugin (.zip)';
+
+  const downloadBlockHtml = downloadUrl
+    ? `
+    <h3 style="color: #334155; font-size: 16px;">Téléchargement de l'extension :</h3>
+    <p style="margin: 20px 0;">
+      <a href="${downloadUrl}" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-weight: 600;">${downloadButtonLabel}</a>
+    </p>
+    <p style="font-size: 12px; color: #64748b; word-break: break-all;">
+      Lien direct : <a href="${downloadUrl}" style="color: #2563eb;">${downloadUrl}</a>
+    </p>`
+    : '';
 
   const html = `<!DOCTYPE html>
 <html>
@@ -96,15 +110,7 @@ L'équipe RGAA Audit
       <li><strong>Plan :</strong> ${plan}</li>
       <li><strong>Domaine :</strong> ${domain}</li>
       <li><strong>Date d'expiration :</strong> ${expires}</li>
-    </ul>
-
-    <h3 style="color: #334155; font-size: 16px;">Téléchargement de l'extension :</h3>
-    <p style="margin: 20px 0;">
-      <a href="${dlLink}" style="display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-weight: 600;">Télécharger le plugin (.zip)</a>
-    </p>
-    <p style="font-size: 12px; color: #64748b; word-break: break-all;">
-      Lien direct : <a href="${dlLink}" style="color: #2563eb;">${dlLink}</a>
-    </p>
+    </ul>${downloadBlockHtml}
 
     <p style="margin-top: 25px; padding-top: 20px; border-top: 1px solid #e2e8f0; font-size: 14px; color: #64748b;">
       Pour l'activer, rendez-vous dans l'administration WordPress de votre site :<br>

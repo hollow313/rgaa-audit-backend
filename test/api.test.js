@@ -2,6 +2,9 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
+const fs = require('node:fs');
+const path = require('node:path');
 const app = require('../src/server');
 const db = require('../src/db');
 const config = require('../src/config');
@@ -1322,5 +1325,425 @@ describe('API Endpoints', () => {
     assert.equal(updRes.status, 403);
     const updBody = await updRes.json();
     assert.equal(updBody.error, 'invalid_license');
+  });
+
+  /* ----------------------------------------------------
+     M-03 & M-04: Releases API & Dynamic Email Download URL
+  ---------------------------------------------------- */
+
+  function makePluginZip(version, files = null) {
+    const list = files || [
+      { name: 'rgaa-audit/rgaa-audit.php', data: `<?php\n/*\n * Plugin Name: RGAA Audit\n * Version: ${version}\n */\n` },
+      { name: 'rgaa-audit/readme.txt', data: `=== RGAA Audit ===\nStable tag: ${version}\n` }
+    ];
+
+    const localHeaders = [];
+    const cdHeaders = [];
+    let offset = 0;
+
+    for (const f of list) {
+      const fnBuf = Buffer.from(f.name, 'utf8');
+      const dataBuf = Buffer.from(f.data, 'utf8');
+      const deflated = zlib.deflateRawSync(dataBuf);
+      const compSize = deflated.length;
+      const uncompSize = dataBuf.length;
+
+      const lh = Buffer.alloc(30 + fnBuf.length);
+      lh.writeUInt32LE(0x04034b50, 0);
+      lh.writeUInt16LE(20, 4);
+      lh.writeUInt16LE(0, 6);
+      lh.writeUInt16LE(8, 8);
+      lh.writeUInt32LE(0, 10);
+      lh.writeUInt32LE(0, 14);
+      lh.writeUInt32LE(compSize, 18);
+      lh.writeUInt32LE(uncompSize, 22);
+      lh.writeUInt16LE(fnBuf.length, 26);
+      lh.writeUInt16LE(0, 28);
+      fnBuf.copy(lh, 30);
+
+      const localChunk = Buffer.concat([lh, deflated]);
+      localHeaders.push(localChunk);
+
+      const cd = Buffer.alloc(46 + fnBuf.length);
+      cd.writeUInt32LE(0x02014b50, 0);
+      cd.writeUInt16LE(20, 4);
+      cd.writeUInt16LE(20, 6);
+      cd.writeUInt16LE(0, 8);
+      cd.writeUInt16LE(8, 10);
+      cd.writeUInt32LE(0, 12);
+      cd.writeUInt32LE(0, 16);
+      cd.writeUInt32LE(compSize, 20);
+      cd.writeUInt32LE(uncompSize, 24);
+      cd.writeUInt16LE(fnBuf.length, 28);
+      cd.writeUInt16LE(0, 30);
+      cd.writeUInt16LE(0, 32);
+      cd.writeUInt16LE(0, 34);
+      cd.writeUInt16LE(0, 36);
+      cd.writeUInt32LE(0, 38);
+      cd.writeUInt32LE(offset, 42);
+      fnBuf.copy(cd, 46);
+      cdHeaders.push(cd);
+
+      offset += localChunk.length;
+    }
+
+    const cdBuf = Buffer.concat(cdHeaders);
+    const cdOffset = offset;
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(list.length, 8);
+    eocd.writeUInt16LE(list.length, 10);
+    eocd.writeUInt32LE(cdBuf.length, 12);
+    eocd.writeUInt32LE(cdOffset, 16);
+    eocd.writeUInt16LE(0, 20);
+
+    return Buffer.concat([...localHeaders, cdBuf, eocd]);
+  }
+
+  it('M-03: POST /api/releases rejects unauthenticated request with 401', async () => {
+    app.resetRateLimits();
+    const res = await fetch(`${baseUrl}/api/releases?version=0.2.2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip' },
+      body: Buffer.from('dummy')
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('M-03: POST /api/releases rejects non-semver version with 400', async () => {
+    app.resetRateLimits();
+    const res = await fetch(`${baseUrl}/api/releases?version=latest`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: Buffer.from('dummy')
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'invalid_version');
+  });
+
+  it('M-03: POST /api/releases rejects zip with invalid root directory with 422 and writes no file', async () => {
+    app.resetRateLimits();
+    const badZip = makePluginZip('0.2.2', [
+      { name: 'wrong-folder/rgaa-audit.php', data: '<?php /* Version: 0.2.2 */' }
+    ]);
+    const res = await fetch(`${baseUrl}/api/releases?version=0.2.2`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: badZip
+    });
+    assert.equal(res.status, 422);
+    const body = await res.json();
+    assert.equal(body.error, 'invalid_root_directory');
+
+    // Verify no file was written to disk
+    const targetFile = path.join(config.releasesDir, 'rgaa-audit-0.2.2.zip');
+    assert.equal(fs.existsSync(targetFile), false);
+  });
+
+  it('M-03: POST /api/releases rejects version mismatch with 422 and writes no file', async () => {
+    app.resetRateLimits();
+    // Declared: 0.2.2, but internal PHP header: 0.2.1
+    const mismatchZip = makePluginZip('0.2.1');
+    const res = await fetch(`${baseUrl}/api/releases?version=0.2.2`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: mismatchZip
+    });
+    assert.equal(res.status, 422);
+    const body = await res.json();
+    assert.equal(body.error, 'version_mismatch');
+    assert.equal(body.zip_version, '0.2.1');
+    assert.equal(body.declared, '0.2.2');
+
+    // Verify no file written
+    const targetFile = path.join(config.releasesDir, 'rgaa-audit-0.2.2.zip');
+    assert.equal(fs.existsSync(targetFile), false);
+  });
+
+  it('M-03: POST /api/releases publishes valid 0.2.2 zip, returns 201 with sha256 and size matching file on disk', async () => {
+    app.resetRateLimits();
+    const validZip = makePluginZip('0.2.2');
+    const res = await fetch(`${baseUrl}/api/releases?version=0.2.2&requires=6.5&tested=7.1&requires_php=8.1`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: validZip
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.version, '0.2.2');
+    assert.ok(body.sha256);
+    assert.equal(typeof body.size, 'number');
+
+    // Check file on disk
+    const targetFile = path.join(config.releasesDir, 'rgaa-audit-0.2.2.zip');
+    assert.ok(fs.existsSync(targetFile));
+    const diskContent = fs.readFileSync(targetFile);
+    const diskSha = crypto.createHash('sha256').update(diskContent).digest('hex');
+    assert.equal(body.sha256, diskSha);
+    assert.equal(body.size, diskContent.length);
+
+    // Verify DB record
+    const relDb = db.getRelease('0.2.2');
+    assert.ok(relDb);
+    assert.equal(relDb.sha256, diskSha);
+    assert.equal(relDb.requires, '6.5');
+    assert.equal(relDb.tested, '7.1');
+    assert.equal(relDb.requires_php, '8.1');
+  });
+
+  it('M-03 & M-04: GET /v1/updates and /v1/download immediately serve release 0.2.2 without cache delay', async () => {
+    app.resetRateLimits();
+    // Generate valid test license key
+    const testId = 'lic_rel_test_' + Date.now();
+    const signed = signLicense({
+      id: testId,
+      plan: 'solo',
+      sites: 1,
+      domain: 'rel-test.org',
+      expires: '2029-12-31'
+    });
+    db.createLicense({
+      id: testId,
+      email: 'rel-test@org.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'rel-test.org',
+      expires_at: '2029-12-31',
+      status: 'active',
+      signed_key: signed.key
+    });
+
+    const updRes = await fetch(`${baseUrl}/v1/updates/rgaa-audit?key=${signed.key}`);
+    assert.equal(updRes.status, 200);
+    const envelope = await updRes.json();
+    const manifest = JSON.parse(Buffer.from(envelope.payload, 'base64url').toString('utf8'));
+    assert.equal(manifest.version, '0.2.2');
+    assert.ok(manifest.download_url.includes('/v1/download/0.2.2.zip'));
+
+    // Download the zip
+    const dlRes = await fetch(`${baseUrl}/v1/download/0.2.2.zip?key=${signed.key}`);
+    assert.equal(dlRes.status, 200);
+    assert.equal(dlRes.headers.get('content-type'), 'application/zip');
+    const dlBuf = Buffer.from(await dlRes.arrayBuffer());
+    const dlSha = crypto.createHash('sha256').update(dlBuf).digest('hex');
+    assert.equal(dlSha, manifest.sha256);
+
+    // Download counter should increment
+    const relAfterDl = db.getRelease('0.2.2');
+    assert.ok(relAfterDl.download_count >= 1);
+  });
+
+  it('M-03: DELETE /api/releases/:version returns 409 cannot_delete_latest for newest release', async () => {
+    app.resetRateLimits();
+    const res = await fetch(`${baseUrl}/api/releases/0.2.2`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${config.adminToken}`
+      }
+    });
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.error, 'cannot_delete_latest');
+  });
+
+  it('M-03 & M-04: Publish 0.2.3, then delete older 0.2.2 succeeds with 204', async () => {
+    app.resetRateLimits();
+    // 1. Publish 0.2.3
+    const zip023 = makePluginZip('0.2.3');
+    const pubRes = await fetch(`${baseUrl}/api/releases?version=0.2.3`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: zip023
+    });
+    assert.equal(pubRes.status, 201);
+
+    // Verify 0.2.3 is now latest
+    const latest = db.getLatestRelease();
+    assert.equal(latest.version, '0.2.3');
+
+    // 2. Delete older 0.2.2
+    app.resetRateLimits();
+    const delRes = await fetch(`${baseUrl}/api/releases/0.2.2`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${config.adminToken}`
+      }
+    });
+    assert.equal(delRes.status, 204);
+    assert.equal(Boolean(db.getRelease('0.2.2')), false);
+    assert.equal(fs.existsSync(path.join(config.releasesDir, 'rgaa-audit-0.2.2.zip')), false);
+
+    // 3. GET /api/releases lists 0.2.3
+    app.resetRateLimits();
+    const listRes = await fetch(`${baseUrl}/api/releases`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
+    assert.equal(listRes.status, 200);
+    const listBody = await listRes.json();
+    assert.ok(Array.isArray(listBody.releases));
+    assert.equal(listBody.releases[0].version, '0.2.3');
+  });
+
+  it('M-04: License email contains version 0.2.3 download link (not hardcoded 0.2.0)', async () => {
+    app.resetRateLimits();
+    let capturedEmail = null;
+    mailer.setMockTransporter({
+      sendMail: async (opts) => {
+        capturedEmail = opts;
+        return { messageId: 'msg_023' };
+      }
+    });
+
+    const eventId = 'evt_buy_023_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        customer: { email: 'buyer-023@test.org' },
+        plan: 'solo',
+        sites: 1,
+        domain: 'buyer023.org',
+        order_id: 'ord_023_' + Date.now()
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    assert.ok(capturedEmail);
+    assert.ok(capturedEmail.text.includes('/v1/download/0.2.3.zip?key='));
+    assert.ok(capturedEmail.html.includes('/v1/download/0.2.3.zip?key='));
+    assert.ok(capturedEmail.html.includes('Télécharger la version 0.2.3 (.zip)'));
+    assert.ok(!capturedEmail.text.includes('0.2.0.zip'));
+  });
+
+  it('M-04: When no releases exist in DB, email sends in 200 without download block', async () => {
+    app.resetRateLimits();
+    let capturedEmail = null;
+    mailer.setMockTransporter({
+      sendMail: async (opts) => {
+        capturedEmail = opts;
+        return { messageId: 'msg_norelease' };
+      }
+    });
+
+    // Temporarily delete all releases
+    db.getDb().prepare('DELETE FROM releases').run();
+    app.invalidateManifestCache();
+
+    const eventId = 'evt_buy_norel_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        customer: { email: 'buyer-norel@test.org' },
+        plan: 'solo',
+        sites: 1,
+        domain: 'buyernorel.org',
+        order_id: 'ord_norel_' + Date.now()
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    assert.ok(capturedEmail);
+    // Email should NOT contain download block or dead link
+    assert.ok(!capturedEmail.text.includes('Téléchargement de l\'extension :'));
+    assert.ok(!capturedEmail.text.includes('/v1/download/'));
+    assert.ok(!capturedEmail.html.includes('Téléchargement de l\'extension :'));
+  });
+
+  it('M-04: Publishing 0.2.4 dynamically updates email in subsequent purchase and renewal without container restart', async () => {
+    app.resetRateLimits();
+    // 1. Publish 0.2.4
+    const zip024 = makePluginZip('0.2.4');
+    const pubRes = await fetch(`${baseUrl}/api/releases?version=0.2.4`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: zip024
+    });
+    assert.equal(pubRes.status, 201);
+
+    let capturedEmail = null;
+    mailer.setMockTransporter({
+      sendMail: async (opts) => {
+        capturedEmail = opts;
+        return { messageId: 'msg_024' };
+      }
+    });
+
+    // 2. Initial purchase immediately gets 0.2.4
+    const eventId = 'evt_buy_024_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        customer: { email: 'buyer-024@test.org' },
+        plan: 'solo',
+        sites: 1,
+        domain: 'buyer024.org',
+        order_id: 'ord_024_' + Date.now()
+      }
+    };
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    assert.ok(capturedEmail);
+    assert.ok(capturedEmail.text.includes('/v1/download/0.2.4.zip?key='));
+    assert.ok(capturedEmail.html.includes('Télécharger la version 0.2.4 (.zip)'));
+
+    // 3. Renewal also gets 0.2.4
+    capturedEmail = null;
+    const renewalId = 'evt_renew_024_' + Date.now();
+    const renewalPayload = {
+      id: renewalId,
+      type: 'subscription.cycled',
+      data: {
+        id: payload.data.order_id,
+        current_period_end: '2030-01-01T00:00:00Z'
+      }
+    };
+    const renewalHeaders = makeWebhookHeaders('polar', renewalPayload, config.polarWebhookSecret);
+    const renewRes = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: renewalHeaders,
+      body: JSON.stringify(renewalPayload)
+    });
+    assert.equal(renewRes.status, 200);
+    assert.ok(capturedEmail);
+    assert.ok(capturedEmail.text.includes('/v1/download/0.2.4.zip?key='));
+    assert.ok(capturedEmail.html.includes('Télécharger la version 0.2.4 (.zip)'));
   });
 });

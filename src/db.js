@@ -91,6 +91,7 @@ function initSchema(db) {
       requires_php TEXT,
       download_url TEXT,
       changelog    TEXT,
+      download_count INTEGER NOT NULL DEFAULT 0,
       published_at TEXT NOT NULL
     );
   `);
@@ -113,6 +114,9 @@ function initSchema(db) {
   } catch {}
   try {
     db.exec("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'received';");
+  } catch {}
+  try {
+    db.exec('ALTER TABLE releases ADD COLUMN download_count INTEGER NOT NULL DEFAULT 0;');
   } catch {}
   try {
     db.exec("ALTER TABLE events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;");
@@ -462,6 +466,25 @@ function getLatestRelease(customDb = null) {
   return stmt.get();
 }
 
+function listReleases(customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('SELECT * FROM releases ORDER BY published_at DESC');
+  return stmt.all();
+}
+
+function deleteRelease(version, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('DELETE FROM releases WHERE version = ?');
+  const info = stmt.run(version);
+  return typeof info?.changes === 'number' && info.changes > 0;
+}
+
+function incrementReleaseDownloads(version, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('UPDATE releases SET download_count = download_count + 1 WHERE version = ?');
+  stmt.run(version);
+}
+
 function purgeOldEvents(days = 90, customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`DELETE FROM events WHERE datetime(received_at) < datetime('now', '-' || ? || ' days')`);
@@ -510,5 +533,8 @@ module.exports = {
   getRevokedLicenses,
   createRelease,
   getRelease,
-  getLatestRelease
+  getLatestRelease,
+  listReleases,
+  deleteRelease,
+  incrementReleaseDownloads
 };
