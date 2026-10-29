@@ -43,6 +43,7 @@ Usage:
   node src/cli.js publish --zip <path> --version <semver> [--requires <ver>] [--tested <ver>] [--requires-php <ver>]
   node src/cli.js verify --key <key>
   node src/cli.js keypair
+  node src/cli.js purge-events [--days 90]
 `);
 }
 
@@ -216,6 +217,13 @@ async function main() {
       console.log(`Paire de clés RSA prête.`);
       console.log(`Clé privée : ${config.keyPath}`);
       console.log(`Clé publique : ${config.publicKeyPath}`);
+      break;
+    }
+
+    case 'purge-events': {
+      const days = args.days ? parseInt(args.days, 10) : 90;
+      const count = db.purgeOldEvents(days);
+      console.log(`Purge terminée : ${count} événement(s) de plus de ${days} jours supprimé(s).`);
       break;
     }
 

@@ -310,13 +310,19 @@ app.get('/api/shared', (req, res) => {
    Core Endpoints
 ---------------------------------------------------- */
 
-// Healthcheck (§8 Ops)
+// Healthcheck (§8 Ops & Recette)
 app.get('/healthz', (req, res) => {
   try {
     const row = db.getDb().prepare('SELECT 1 as ok').get();
-    res.json({ ok: true, db: Boolean(row && row.ok === 1) });
+    const isDbOk = Boolean(row && row.ok === 1);
+
+    if (!config.polarWebhookSecret || !config.paddleWebhookSecret) {
+      return res.status(503).json({ error: 'webhook_secret_missing' });
+    }
+
+    res.json({ ok: true, db: isDbOk });
   } catch (err) {
-    res.status(500).json({ ok: false, db: false, error: err.message });
+    res.status(500).json({ error: 'internal' });
   }
 });
 
@@ -526,7 +532,7 @@ function requireWebhookHmac(provider) {
   return (req, res, next) => {
     const secret = provider === 'polar' ? config.polarWebhookSecret : config.paddleWebhookSecret;
     if (!secret) {
-      return res.status(401).json({ error: 'unauthorized', message: 'Webhook secret is not configured' });
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
     let timestamp = null;
@@ -577,13 +583,13 @@ function requireWebhookHmac(provider) {
 
     // 1. Missing headers -> 401
     if (!timestamp || isNaN(timestamp) || signatureCandidates.length === 0) {
-      return res.status(401).json({ error: 'unauthorized', message: 'Missing webhook signature or timestamp headers' });
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
-    // 2. Reject if |now - timestamp| > 300 s
+    // 2. Reject if |now - timestamp| > 300 s -> 401
     const now = Math.floor(Date.now() / 1000);
     if (Math.abs(now - timestamp) > 300) {
-      return res.status(401).json({ error: 'unauthorized', message: 'Webhook timestamp expired or in the future' });
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
     // 3. HMAC-SHA256 calculated on raw body bytes (req.rawBody)
@@ -625,7 +631,7 @@ function requireWebhookHmac(provider) {
     }
 
     if (!matched) {
-      return res.status(401).json({ error: 'unauthorized', message: 'Invalid webhook signature' });
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
     next();

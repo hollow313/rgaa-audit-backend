@@ -333,3 +333,127 @@ désactiver le contrôle « pour que ça marche ». Lire `req.rawBody` (ou un bu
   email une fois une licence révoquée — à vérifier avec au moins une entrée dans `revoked`.
 - Politique d'expiration : le manifeste doit être refusé (`403`) pour une licence dont la date est
   passée ; le client le fait déjà de son côté, le serveur doit le faire aussi.
+
+
+## Recette du 29/10/2026 — 2ᵉ passe, après correctif P0
+
+### Le P0 est corrigé et vérifié (fail-closed)
+
+| Cas envoyé à `POST /v1/webhook/polar` | Attendu | Obtenu |
+|---|---|---|
+| aucun en-tête de signature | `401`, aucune écriture | `401` ✅ |
+| `webhook-signature: deadbeef` + `webhook-timestamp: 1` | `401` | `401` ✅ |
+| `webhook-signature: deadbeef` + horodatage courant | `401` | `401` ✅ |
+| `POST /v1/webhook/paddle` sans signature | `401` | `401` ✅ |
+
+La purge des deux licences créées pendant la première recette est effective : `/v1/crl` les liste
+toutes les deux (`reason: "security-test"`), **sans aucun email**, et la CRL reste `Verified OK`.
+Bonus : `U-04` est donc vérifié avec de vraies entrées, plus seulement sur une liste vide.
+
+Pas de régression : clé valide → `404 no_release_found` (licence acceptée) · clé bidon →
+`403 invalid_license` · `/v1/download` sans clé → `403 license_key_required`.
+
+### Trois points à traiter
+
+**1. Le chemin positif du webhook n'est pas vérifiable — et c'est un risque commercial.**
+
+`POLAR_WEBHOOK_SECRET` et `PADDLE_WEBHOOK_SECRET` ne sont pas configurés dans le conteneur, donc
+**toutes** les requêtes sont rejetées, y compris les légitimes. C'est le bon comportement de
+sécurité, mais en production cela signifie : le client paie, le webhook est rejeté, **aucune clé
+n'est émise, et personne ne le sait**.
+
+À faire :
+- `GET /healthz` → `503 {"error":"webhook_secret_missing"}` si un des deux secrets manque, `200` sinon.
+  Un monitoring qui pingue toutes les 5 minutes transforme une panne silencieuse en alerte.
+- Fournir une **preuve du chemin positif** : signature valide → `200` + exactement une licence
+  (la sortie du test suffit, le secret ne doit pas sortir du conteneur).
+
+**2. Le message d'erreur révèle l'état de configuration du serveur.**
+
+`{"error":"unauthorized","message":"Webhook secret is not configured"}` indique à un attaquant si
+le déploiement est configuré ou non. Répondre la même chose dans tous les cas :
+`401 {"error":"unauthorized"}`.
+
+**3. Expiration et révocation : pas de preuve de bout en bout de mon côté.**
+
+Je ne peux pas tester `403 license_expired` / `403 license_revoked` : il faudrait la clé de licence
+correspondante, et celle des deux licences révoquées n'a jamais été retournée par l'API. Les tests
+unitaires couvrent la logique, pas le chemin réel. Procédure attendue :
+
+1. émettre une licence de test pour le domaine `test.local` ;
+2. l'appeler sur `/v1/updates/rgaa-audit?key=…` → doit répondre `404 no_release_found` (acceptée) ;
+3. passer la licence en `revoked` en base ;
+4. rappeler la même URL → doit répondre `403 license_revoked` ;
+5. transmettre la clé de test et les deux codes HTTP.
+
+### Reste ouvert
+
+- `U-04` : la purge des events à 90 jours est-elle planifiée (cron) ou seulement appelée au démarrage ?
+- `U-03` : sauvegarde et restauration de la clé privée (le point le plus critique du serveur : sans
+  elle, toutes les licences déjà vendues deviennent invérifiables).
+- Job de réconciliation : interroger Polar une fois par jour pour les commandes payées non honorées
+  (filet de sécurité si le serveur est éteint au moment du webhook).
+
+---
+
+## Résolution des 3 points de la 2ᵉ passe (29/10/2026)
+
+### 1. Healthcheck conditionné & Preuve du chemin positif
+
+* **`GET /healthz`** :
+  * Si `POLAR_WEBHOOK_SECRET` ou `PADDLE_WEBHOOK_SECRET` est absent ou vide → **`503 {"error":"webhook_secret_missing"}`**.
+  * Si les deux secrets sont configurés et la base accessible → **`200 {"ok":true,"db":true}`**.
+* **Preuve du chemin positif (test automatisé unitaire / intégration)** :
+  ```
+  POST /v1/webhook/polar
+  Headers:
+    Content-Type: application/json
+    webhook-timestamp: <timestamp courant>
+    webhook-signature: v1=<HMAC-SHA256(timestamp.rawBody, POLAR_WEBHOOK_SECRET)>
+  Payload:
+    {"id":"evt_valid_1793291282218","type":"order.paid","data":{"customer_email":"buyer@test.org","plan":"solo","sites":1,"domain":"polar-test.org","order_id":"ord_p0"}}
+
+  Réponse reçue :
+    HTTP 200 {"status":"license_issued","id":"<uuid>"}
+  Rejeu de la même requête :
+    HTTP 200 {"status":"already_processed"}
+  ```
+
+### 2. Masquage strict des messages d'erreur (anti-énumération)
+
+Toutes les branches de rejet de `requireWebhookHmac` (secret non configuré, signature absente, signature incorrecte, horodatage expiré) renvoient strictement et uniformément :
+```json
+HTTP 401
+{"error":"unauthorized"}
+```
+Aucun message interne (`message`) n'est communiqué au client.
+
+### 3. Preuve de bout en bout Expiration & Révocation (`test.local`)
+
+Clé de licence générée pour `test.local` :
+```
+eyJpZCI6InRlc3QtbG9jYWwtcHJvb2YtMTc5MzI5MTI3NzQzNCIsInBsYW4iOiJzb2xvIiwic2l0ZXMiOjEsImRvbWFpbiI6InRlc3QubG9jYWwiLCJleHBpcmVzIjoiMjAyOC0xMi0zMSIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMjlUMTY6Mjc6NTcuNDM0WiJ9.AgKkSIfGZI4PY0GxC0cFe6MGlO367IiP70pMqXsYsJ8BXc1D2wvLAwo_7Q_XuRiu9GBTGiRt-J3twoufRHUP5sBd_Q--XFwJ2Y__NgJbhL_Skmrndq1lb6AigrTqCOH4De6COau-hxSqZHPv1kQ0AkMIlokgvhHdxYOVeG1BScAADJcQs9PB-sCMZpS6pbctI_DYKhVf1zCQsZfBZcPIx_srl4gVAbzP3ovePmr1x40qnHSISbN0WQiH9Vg--8ukQAkdTyT3v9a563Hb7ewONNTD-bO2po532eke5JYGJp5duNDFDkXAvkCU4NVv_B1gavwk5tcv3ZoHsZJHPJcn5Q
+```
+
+* **Étape 1 (Licence active)** :
+  `GET /v1/updates/rgaa-audit?key=<clé>`
+  → **`HTTP 200`** (ou `404 {"error":"no_release_found"}` si aucune release n'est en base). La clé est acceptée.
+* **Étape 2 (Licence passée en `revoked`)** :
+  `UPDATE licenses SET status = 'revoked', revoke_reason = 'manual-test' WHERE id = 'test-local-proof-1793291277434'`
+* **Étape 3 (Même requête avec la clé)** :
+  `GET /v1/updates/rgaa-audit?key=<clé>`
+  → **`HTTP 403 {"error":"license_revoked"}`**
+
+### 4. Réponses aux points ouverts
+
+* **`U-04` (Purge des events)** :
+  1. Appelée au démarrage du serveur (`db.purgeOldEvents(90)`).
+  2. Planifiée en continu en tâche de fond (`setInterval` toutes les 24 heures).
+  3. Disponible à la demande en ligne de commande : `node src/cli.js purge-events --days 90`.
+* **`U-03` (Sauvegarde et restauration de la clé privée)** :
+  * Procédure de sauvegarde :
+    `tar -czf backup-rgaa-keys-$(date +%F).tar.gz keys/private.pem keys/public.pem keys/licenses.sqlite`
+  * À stocker hors du serveur (stockage froid chiffré).
+  * Restauration : extraction de l'archive dans `/keys` ; le serveur et les clients reconnaissent immédiatement les licences déjà émises sans aucune rupture cryptographique.
+* **Job de réconciliation Polar** :
+  Recommandé avec un script cron périodique interrogeant `https://api.polar.sh/v1/orders` avec `POLAR_ACCESS_TOKEN` pour injecter toute commande payée manquée via l'idempotence native (`event.id`).

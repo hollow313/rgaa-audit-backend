@@ -93,12 +93,27 @@ describe('API Endpoints', () => {
     assert.ok(typeof stats.active === 'number');
   });
 
-  it('GET /healthz returns ok and db status', async () => {
+  it('GET /healthz returns ok and db status when webhook secrets configured', async () => {
     const res = await fetch(`${baseUrl}/healthz`);
     assert.equal(res.status, 200);
     const data = await res.json();
     assert.equal(data.ok, true);
     assert.equal(data.db, true);
+  });
+
+  it('GET /healthz returns 503 webhook_secret_missing when secrets are not configured', async () => {
+    const prevPolar = config.polarWebhookSecret;
+    const prevPaddle = config.paddleWebhookSecret;
+    try {
+      config.polarWebhookSecret = '';
+      const res = await fetch(`${baseUrl}/healthz`);
+      assert.equal(res.status, 503);
+      const data = await res.json();
+      assert.equal(data.error, 'webhook_secret_missing');
+    } finally {
+      config.polarWebhookSecret = prevPolar;
+      config.paddleWebhookSecret = prevPaddle;
+    }
   });
 
   it('GET /v1/public-key returns PEM public key', async () => {
@@ -245,10 +260,10 @@ describe('API Endpoints', () => {
     });
     assert.equal(res.status, 401);
     const body = await res.json();
-    assert.equal(body.error, 'unauthorized');
+    assert.deepEqual(body, { error: 'unauthorized' });
   });
 
-  it('P0: POST /v1/webhook/polar rejects invalid signature with 401', async () => {
+  it('P0: POST /v1/webhook/polar rejects invalid signature with 401 { error: "unauthorized" }', async () => {
     const payload = { id: 'evt_bad_sig', type: 'order.paid' };
     const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret, { badSignature: true });
     const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
@@ -257,9 +272,11 @@ describe('API Endpoints', () => {
       body: JSON.stringify(payload)
     });
     assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.deepEqual(body, { error: 'unauthorized' });
   });
 
-  it('P0: POST /v1/webhook/polar rejects expired timestamp (> 300 s) with 401', async () => {
+  it('P0: POST /v1/webhook/polar rejects expired timestamp (> 300 s) with 401 { error: "unauthorized" }', async () => {
     const payload = { id: 'evt_expired_ts', type: 'order.paid' };
     const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret, { timestamp: 1 });
     const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
@@ -268,6 +285,8 @@ describe('API Endpoints', () => {
       body: JSON.stringify(payload)
     });
     assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.deepEqual(body, { error: 'unauthorized' });
   });
 
   it('P0: POST /v1/webhook/polar accepts valid signature and creates a single license', async () => {
@@ -341,14 +360,13 @@ describe('API Endpoints', () => {
     const id1 = '24fcfea8-238f-4f67-8366-f11ffd673f2b';
     const id2 = '2b263539-976d-401e-bee1-ee8451ab2f21';
 
-    // Even if inserted, db.revokeSecurityTestLicenses() marks them revoked
-    db.createLicense({
-      id: id1,
-      email: 'test@example.com',
-      domain: 'test.fr',
-      expires_at: '2030-01-01',
-      status: 'active'
-    });
+    const dbInst = db.getDb();
+    dbInst.prepare(`
+      INSERT INTO licenses (id, email, plan, sites, domain, expires_at, status, provider, created_at)
+      VALUES (?, 'test@example.com', 'solo', 1, 'test.fr', '2030-01-01', 'active', 'test', datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET status = 'active', revoke_reason = NULL
+    `).run(id1);
+
     db.revokeSecurityTestLicenses();
 
     const lic1 = db.getLicenseById(id1);
@@ -409,6 +427,45 @@ describe('API Endpoints', () => {
     assert.equal(res.status, 403);
     const body = await res.json();
     assert.equal(body.error, 'license_revoked');
+  });
+
+  it('Recette 2 Point 3: test.local end-to-end accepted (200/404) then revoked (403 license_revoked)', async () => {
+    const licId = 'test-local-uuid-' + Date.now();
+    const payload = {
+      id: licId,
+      plan: 'solo',
+      sites: 1,
+      domain: 'test.local',
+      expires: '2028-12-31',
+      issued_at: new Date().toISOString()
+    };
+    const signed = signLicense(payload);
+
+    // 1. Émettre la licence en base (active)
+    db.createLicense({
+      id: licId,
+      email: 'client@test.local',
+      plan: 'solo',
+      sites: 1,
+      domain: 'test.local',
+      expires_at: '2028-12-31',
+      status: 'active',
+      signed_key: signed.key
+    });
+
+    // 2. Appel /v1/updates/rgaa-audit?key=... (licence acceptée -> statut 404 si pas de release ou 200 si release existe)
+    const resActive = await fetch(`${baseUrl}/v1/updates/rgaa-audit?key=${signed.key}`);
+    assert.notEqual(resActive.status, 403, 'Active license key must not be rejected with 403');
+    assert.ok(resActive.status === 200 || resActive.status === 404);
+
+    // 3. Passer la licence en revoked
+    db.updateLicenseStatus(licId, 'revoked', 'user_cancellation');
+
+    // 4. Rappeler la même URL avec la même clé -> doit répondre 403 license_revoked
+    const resRevoked = await fetch(`${baseUrl}/v1/updates/rgaa-audit?key=${signed.key}`);
+    assert.equal(resRevoked.status, 403);
+    const bodyRevoked = await resRevoked.json();
+    assert.equal(bodyRevoked.error, 'license_revoked');
   });
 
   /* ----------------------------------------------------
