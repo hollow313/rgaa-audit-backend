@@ -42,6 +42,7 @@ describe('API Endpoints', () => {
   let baseUrl;
 
   before(async () => {
+    config.adminToken = 'test_admin_token_secret_12345';
     config.polarWebhookSecret = 'test_polar_secret_key_12345';
     config.paddleWebhookSecret = 'test_paddle_secret_key_12345';
     initKeypair();
@@ -68,10 +69,50 @@ describe('API Endpoints', () => {
     assert.ok(html.includes('licenses-table'));
   });
 
-  it('Web UI API: POST /api/licenses creates license and returns signed key', async () => {
+  it('P0: Web UI API: POST /api/licenses rejects unauthenticated call with 401', async () => {
     const res = await fetch(`${baseUrl}/api/licenses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'attacker@example.com',
+        plan: 'solo',
+        sites: 1,
+        domain: 'attack.com',
+        expires: '2029-10-10'
+      })
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.deepEqual(body, { error: 'unauthorized' });
+  });
+
+  it('P0: Web UI API: POST /api/licenses rejects invalid Bearer token with 401', async () => {
+    const res = await fetch(`${baseUrl}/api/licenses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer wrong_token_value'
+      },
+      body: JSON.stringify({
+        email: 'attacker@example.com',
+        plan: 'solo',
+        sites: 1,
+        domain: 'attack.com',
+        expires: '2029-10-10'
+      })
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.deepEqual(body, { error: 'unauthorized' });
+  });
+
+  it('Web UI API: POST /api/licenses creates license and returns signed key with valid ADMIN_TOKEN', async () => {
+    const res = await fetch(`${baseUrl}/api/licenses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
       body: JSON.stringify({
         email: 'webuser@example.com',
         plan: 'solo',
@@ -87,16 +128,20 @@ describe('API Endpoints', () => {
     assert.equal(data.license.domain, 'webtest.fr');
   });
 
-  it('Web UI API: GET /api/licenses lists licenses with keys', async () => {
-    const res = await fetch(`${baseUrl}/api/licenses`);
+  it('Web UI API: GET /api/licenses lists licenses with keys with valid ADMIN_TOKEN', async () => {
+    const res = await fetch(`${baseUrl}/api/licenses`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
     assert.equal(res.status, 200);
     const list = await res.json();
     assert.ok(Array.isArray(list));
     assert.ok(list.some(l => l.domain === 'webtest.fr' && l.key));
   });
 
-  it('Web UI API: GET /api/stats returns counts', async () => {
-    const res = await fetch(`${baseUrl}/api/stats`);
+  it('Web UI API: GET /api/stats returns counts with valid ADMIN_TOKEN', async () => {
+    const res = await fetch(`${baseUrl}/api/stats`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
     assert.equal(res.status, 200);
     const stats = await res.json();
     assert.ok(typeof stats.total === 'number');
@@ -167,6 +212,8 @@ describe('API Endpoints', () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.valid, true);
+    assert.equal(body.activations, 1);
+    assert.equal(body.sites, 1);
     assert.equal(body.plan, 'solo');
     assert.ok(body.next_update);
   });
@@ -244,6 +291,114 @@ describe('API Endpoints', () => {
     assert.equal(res.status, 403);
     const body = await res.json();
     assert.equal(body.error, 'license_revoked');
+  });
+
+  it('P1 & P2: POST /v1/activate enforces site quota (rejects with 409 quota_exceeded when limit reached)', async () => {
+    const licenseId = 'test-quota-' + Date.now();
+    db.createLicense({
+      id: licenseId,
+      email: 'client@example.com',
+      plan: 'solo',
+      sites: 1,
+      domain: '*',
+      expires_at: '2029-12-31',
+      status: 'active'
+    });
+
+    const signed = signLicense({
+      id: licenseId,
+      license_id: licenseId,
+      plan: 'solo',
+      sites: 1,
+      domain: '*',
+      expires: '2029-12-31'
+    });
+
+    // 1. First activation on site-a.fr succeeds
+    const res1 = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-a.fr' })
+    });
+    assert.equal(res1.status, 200);
+    const body1 = await res1.json();
+    assert.equal(body1.valid, true);
+    assert.equal(body1.activations, 1);
+    assert.equal(body1.sites, 1);
+
+    // 2. Re-activation of the SAME domain site-a.fr succeeds (updates last_seen without exceeding quota)
+    const resReactivate = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-a.fr' })
+    });
+    assert.equal(resReactivate.status, 200);
+    const bodyReactivate = await resReactivate.json();
+    assert.equal(bodyReactivate.activations, 1);
+    assert.equal(bodyReactivate.sites, 1);
+
+    // 3. Second activation on DIFFERENT domain site-b.fr is rejected with 409 quota_exceeded
+    const res2 = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-b.fr' })
+    });
+    assert.equal(res2.status, 409);
+    const body2 = await res2.json();
+    assert.equal(body2.error, 'quota_exceeded');
+    assert.equal(body2.activations, 1);
+    assert.equal(body2.sites, 1);
+  });
+
+  it('P1: POST /v1/deactivate frees a site activation slot allowing migration', async () => {
+    const licenseId = 'test-deact-' + Date.now();
+    db.createLicense({
+      id: licenseId,
+      email: 'client@example.com',
+      plan: 'solo',
+      sites: 1,
+      domain: '*',
+      expires_at: '2029-12-31',
+      status: 'active'
+    });
+
+    const signed = signLicense({
+      id: licenseId,
+      license_id: licenseId,
+      plan: 'solo',
+      sites: 1,
+      domain: '*',
+      expires: '2029-12-31'
+    });
+
+    // 1. Activate site-old.com
+    await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-old.com' })
+    });
+
+    // 2. Deactivate site-old.com
+    const deactRes = await fetch(`${baseUrl}/v1/deactivate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-old.com' })
+    });
+    assert.equal(deactRes.status, 200);
+    const deactBody = await deactRes.json();
+    assert.equal(deactBody.deactivated, true);
+    assert.equal(deactBody.activations, 0);
+
+    // 3. Now activate site-new.com (succeeds because slot was freed)
+    const actRes = await fetch(`${baseUrl}/v1/activate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: signed.key, domain: 'site-new.com' })
+    });
+    assert.equal(actRes.status, 200);
+    const actBody = await actRes.json();
+    assert.equal(actBody.activations, 1);
+    assert.equal(actBody.sites, 1);
   });
 
   it('GET /v1/crl returns signed CRL with revoked licenses', async () => {
@@ -514,18 +669,20 @@ describe('API Endpoints', () => {
   });
 
   /* ----------------------------------------------------
-     B-01 Tests: Route aliases & JSON 404/500
+     B-01 & P2 Tests: Route aliases, key requirement & JSON 404/500
   ---------------------------------------------------- */
-  it('B-01: GET /v1/updates and /v1/updates/rgaa-audit return identical response bytes and status', async () => {
+  it('P2 & B-01: GET /v1/updates and /v1/updates/rgaa-audit require key (403) and return identical response bytes', async () => {
     const res1 = await fetch(`${baseUrl}/v1/updates`);
     const res2 = await fetch(`${baseUrl}/v1/updates/rgaa-audit`);
 
-    assert.equal(res1.status, res2.status);
+    assert.equal(res1.status, 403);
+    assert.equal(res2.status, 403);
     assert.equal(res1.headers.get('content-type'), res2.headers.get('content-type'));
 
     const text1 = await res1.text();
     const text2 = await res2.text();
     assert.equal(text1, text2, 'Both routes must return the exact same response body octet for octet');
+    assert.deepEqual(JSON.parse(text1), { error: 'license_key_required' });
   });
 
   it('B-01: Non-existent route returns 404 with JSON { "error": "not_found" }', async () => {

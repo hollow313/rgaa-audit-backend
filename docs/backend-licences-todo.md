@@ -540,3 +540,121 @@ capturer, et coller les deux HMAC calculés (corps seul vs `id.ts.body`) — cel
   qu'elle ne supprime pas les `events` nécessaires à l'idempotence des webhooks encore en cours
   de réessai par Polar (fenêtre de réessai de Polar : plusieurs jours). Aligner la rétention des
   `events` sur la fenêtre de réessai du fournisseur, pas sur 90 jours arbitraires.
+
+
+## Recette du 29/10/2026 — 4ᵉ passe (auto-contrôle, Standard Webhooks, transactionnalité)
+
+### Validé, avec preuves
+
+| Point | Preuve obtenue |
+|---|---|
+| **Auto-contrôle de signature** | Clé fraîche émise par `POST /api/licenses` → `openssl dgst -sha256 -verify public.pem` → **`Verified OK`**. Le défaut de la 3ᵉ passe venait bien de l'ancien chemin d'émission |
+| **Expiration** | Licence émise avec `expires: 2026-10-01` → `/v1/updates?key=…` → **`403 {"error":"license_expired"}`** |
+| **Révocation** | `POST /api/licenses/5025ea5c-…/revoke` → `/v1/updates?key=…` → **`403 {"error":"license_revoked"}`**, et l'identifiant apparaît **immédiatement** dans `/v1/crl` |
+| **Transactionnalité** | Les licences émises apparaissent dans la CRL après révocation → l'INSERT précède bien la signature |
+| `/healthz` public | **`503 {"ok":false}`**, aucun détail de configuration exposé |
+| Webhooks | 4 variantes rejetées → **`401 {"error":"unauthorized"}`**, y compris un en-tête `v1,AAAA` malformé |
+
+### P0 — L'API d'administration n'a aucune authentification
+
+**CONSTAT.** `POST /api/licenses` et `POST /api/licenses/:id/revoke` répondent `200` **sans aucun
+identifiant**.
+
+**PREUVE.**
+```
+$ curl -X POST -H 'Content-Type: application/json' \
+    -d '{"email":"x@y.z","plan":"solo","sites":1,"domain":"*","expires":"2027-10-30"}' \
+    http://<serveur>/api/licenses
+{"ok":true,"license":{"id":"5025ea5c-…", …},"key":"eyJpZC…"}
+
+$ curl -X POST -H 'Content-Type: application/json' -d '{"reason":"test"}' \
+    http://<serveur>/api/licenses/5025ea5c-…/revoke
+{"ok":true,"license":{"status":"revoked", …}}
+```
+
+**CONSÉQUENCE.** Toute personne qui atteint le service **émet une licence valide sans payer** et
+**révoque les licences de tous les clients**. Aujourd'hui ces routes sont accessibles en LAN ;
+demain, si le reverse proxy route `api.rgaa-audit.eu` vers cette même application, elles sont
+accessibles depuis Internet. C'est plus grave que le webhook non signé de la 1ʳᵉ passe : ici la
+faille contourne entièrement le paiement.
+
+**SPÉCIFICATION.**
+1. `ADMIN_TOKEN` obligatoire sur **toutes** les routes `/api/*` :
+   `Authorization: Bearer <token>`, comparaison en temps constant, `401` sinon.
+2. Le dashboard HTML (`GET /`) doit être servi **seulement** en local (bind `127.0.0.1`) ou derrière
+   la même authentification. Il contient le formulaire d'émission.
+3. Côté reverse proxy : **ne pas router `/api/*` ni `/`** vers l'extérieur. Seuls `/v1/*` doivent
+   être joignables publiquement — et encore, `/v1/*` en lecture seule sauf les webhooks.
+4. Test de non-régression : `POST /api/licenses` sans jeton → `401`.
+
+### P1 — Le quota de sites n'est pas appliqué
+
+**PREUVE.** Licence `plan: solo`, `sites: 1` — deux activations sur des domaines différents :
+```
+POST /v1/activate {"key":…,"domain":"site-a.fr"}  → 200 {"valid":true,…}
+POST /v1/activate {"key":…,"domain":"site-b.fr"}  → 200 {"valid":true,…}
+GET  /api/licenses → activations: ["site-b.fr","site-a.fr"]
+```
+Une licence mono-site est donc utilisable sur un nombre illimité de sites. Le plan Agence (399 €)
+n'apporte aujourd'hui aucune différence fonctionnelle avec Solo (149 €).
+
+**SPÉCIFICATION.** Refuser au-delà de `sites` avec
+`409 {"error":"quota_exceeded","activations":2,"sites":1}`. Prévoir `POST /v1/deactivate`
+{migration de site, changement de domaine} qui libère une place, et exposer la liste des activations
+dans `/api/licenses` (déjà fait).
+
+### P2 — `/v1/activate` ne renvoie ni `activations` ni `sites`
+
+Le plugin affiche « Site activé : 192.168.1.200 » sans le quota. Retourner
+`{"valid":true,"activations":1,"sites":1,"plan":"solo","expires":"2027-10-30"}` pour qu'il puisse
+afficher « 1/1 ».
+
+### P2 — `/v1/updates` sans clé répond quand même
+
+```
+GET /v1/updates/rgaa-audit                    → 404 {"error":"no_release_found"}   ← aucune clé fournie
+GET /v1/updates/rgaa-audit?key=abc.def        → 403 {"error":"invalid_license"}
+```
+Le contrôle est conditionnel (`if (key)`). Si le manifeste doit être réservé aux clients : exiger la
+clé (`403 {"error":"license_key_required"}`). Si le manifeste est volontairement public, l'écrire
+dans la doc et assumer que seule l'archive ZIP est protégée — mais alors un non-client voit les
+numéros de version et les URL de téléchargement.
+
+### Note — le plugin appelle maintenant `/v1/activate`
+
+Version **0.2.2** : à l'enregistrement des réglages, si « contrôle en ligne » est activé, le plugin
+envoie `POST /v1/activate {key, domain}`. Vérifié de bout en bout sur l'instance de test :
+« Site activé : 192.168.1.200 », et l'activation apparaît côté serveur (`activations: ["192.168.1.200"]`).
+Dans le build gratuit, le réglage n'existe pas : aucun appel réseau n'est fait, ce qui préserve
+l'argument de revue wordpress.org.
+
+---
+
+## Résolution des points de la 4ᵉ passe (29/10/2026)
+
+### 1. Authentification stricte de l'API d'administration (P0)
+* **Middleware `requireAdminToken`** : appliqué à **toutes** les routes `/api/*`.
+* Vérifie l'en-tête `Authorization: Bearer <ADMIN_TOKEN>` par comparaison en temps constant (`crypto.timingSafeEqual`).
+* Si absent, vide ou erroné → **`401 {"error":"unauthorized"}`** immédiat.
+* Le tableau de bord Web (`GET /`) intègre désormais un bouton de configuration sécurisé pour l'ADMIN_TOKEN avec mémorisation locale (`localStorage`) et transmission automatique sur tous les appels d'administration.
+
+### 2. Application stricte du quota de sites (P1)
+* **Route `/v1/activate`** :
+  * Vérifie le nombre d'activations distinctes enregistrées pour la licence (`currentActivations.length`).
+  * Si le domaine client n'est pas déjà actif et que `currentActivations.length >= maxSites` :
+    rejet avec **`409 {"error":"quota_exceeded","message":"Site quota exceeded...","activations":N,"sites":maxSites}`**.
+  * Si le même domaine réactive (ex: mise à jour ou reconnexion), l'appel réussit en mettant à jour `last_seen` sans incrémenter le quota.
+* **Nouvelle route `/v1/deactivate`** :
+  * `POST /v1/deactivate { key, domain }`
+  * Valide la clé RSA-SHA256, supprime l'activation du domaine en base (`db.deleteActivation`) et libère le quota pour une migration de site.
+  * Répond **`200 {"deactivated":true,"domain":"...","activations":N,"sites":maxSites}`**.
+
+### 3. Quota retourné sur `/v1/activate` (P2)
+* La réponse de `/v1/activate` renvoie désormais les compteurs exacts :
+  `{"valid":true,"activations":N,"sites":maxSites,"plan":"solo","expires":"...","next_update":"..."}`.
+  Le plugin WordPress affiche ainsi directement « N/max » (ex: « 1/1 »).
+
+### 4. Clé obligatoire sur `/v1/updates` (P2)
+* `GET /v1/updates` et `/v1/updates/:slug` sans paramètre `key` renvoient désormais strictement :
+  **`403 {"error":"license_key_required"}`**.
+* Seuls les clients disposant d'une clé active et valide accèdent au manifeste de mise à jour.

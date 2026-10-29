@@ -205,6 +205,13 @@ function getActivations(license_id, customDb = null) {
   return stmt.all(license_id);
 }
 
+function deleteActivation(license_id, domain, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('DELETE FROM activations WHERE license_id = ? AND domain = ?');
+  const result = stmt.run(license_id, domain);
+  return result.changes > 0;
+}
+
 function getSharedLicenses(customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`
@@ -321,6 +328,7 @@ module.exports = {
   getLicenseStats,
   recordActivation,
   getActivations,
+  deleteActivation,
   getSharedLicenses,
   recordEvent,
   purgeOldEvents,

@@ -310,6 +310,7 @@
         <p>Gestionnaire de licences & mises à jour WordPress</p>
       </div>
       <div class="header-actions">
+        <button class="btn-secondary btn-sm" onclick="promptChangeAdminToken()" title="Configurer le jeton d'authentification administrateur">🔒 Token Admin</button>
         <button class="btn-secondary btn-sm" onclick="showPublicKeyModal()">🔑 Clé publique PEM</button>
         <a href="/v1/crl" target="_blank" style="text-decoration:none;"><button class="btn-secondary btn-sm">📜 Voir CRL</button></a>
         <button class="btn-secondary btn-sm" onclick="loadData()">🔄 Rafraîchir</button>
@@ -481,6 +482,54 @@
     let allLicenses = [];
     let expandedRowId = null;
 
+    function getAdminToken() {
+      return localStorage.getItem('rgaa_admin_token') || '';
+    }
+
+    function setAdminToken(token) {
+      if (token) {
+        localStorage.setItem('rgaa_admin_token', token.trim());
+      } else {
+        localStorage.removeItem('rgaa_admin_token');
+      }
+    }
+
+    function promptChangeAdminToken() {
+      const current = getAdminToken();
+      const nextToken = prompt('Jeton administrateur pour l\'API (ADMIN_TOKEN) :', current);
+      if (nextToken !== null) {
+        setAdminToken(nextToken);
+        loadData();
+      }
+    }
+
+    async function fetchWithAuth(url, options = {}) {
+      let token = getAdminToken();
+      if (!token) {
+        token = prompt('Accès sécurisé : veuillez saisir votre jeton ADMIN_TOKEN :');
+        if (token) {
+          setAdminToken(token);
+        } else {
+          throw new Error('ADMIN_TOKEN requis');
+        }
+      }
+
+      options.headers = options.headers || {};
+      options.headers['Authorization'] = `Bearer ${token}`;
+
+      const res = await fetch(url, options);
+      if (res.status === 401) {
+        setAdminToken('');
+        const retryToken = prompt('Accès refusé (401 non autorisé). Veuillez saisir le jeton ADMIN_TOKEN valide :');
+        if (retryToken) {
+          setAdminToken(retryToken);
+          return fetchWithAuth(url, options);
+        }
+        throw new Error('Accès non autorisé (401)');
+      }
+      return res;
+    }
+
     // Set default expiration date to +1 year
     const nextYear = new Date();
     nextYear.setFullYear(nextYear.getFullYear() + 1);
@@ -489,9 +538,9 @@
     async function loadData() {
       try {
         const [licRes, statsRes, sharedRes] = await Promise.all([
-          fetch('/api/licenses'),
-          fetch('/api/stats'),
-          fetch('/api/shared')
+          fetchWithAuth('/api/licenses'),
+          fetchWithAuth('/api/stats'),
+          fetchWithAuth('/api/shared')
         ]);
 
         allLicenses = await licRes.json();
@@ -524,12 +573,14 @@
         const badgeClass = isRevoked ? 'badge-danger' : 'badge-success';
         const statusLabel = isRevoked ? 'Révoquée' : 'Active';
         const activationsCount = lic.activations_count || 0;
+        const maxSites = lic.sites || 1;
         const isExpanded = expandedRowId === lic.id;
 
-        let activationsBadge = `<span style="color:var(--text-muted); font-size:0.8125rem;">0 site</span>`;
+        let activationsBadge = `<span style="color:var(--text-muted); font-size:0.8125rem;">0 / ${maxSites} site(s)</span>`;
         if (activationsCount > 0) {
           const domsTitle = lic.activated_domains ? `Activé sur : ${lic.activated_domains}` : '';
-          activationsBadge = `<span class="badge badge-success" title="${escapeHtml(domsTitle)}">✓ ${activationsCount} site(s)</span>`;
+          const isAtLimit = activationsCount >= maxSites;
+          activationsBadge = `<span class="badge ${isAtLimit ? 'badge-warning' : 'badge-success'}" title="${escapeHtml(domsTitle)}">✓ ${activationsCount} / ${maxSites} site(s)</span>`;
           if (lic.activated_domains) {
             activationsBadge += `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(lic.activated_domains)}">${escapeHtml(lic.activated_domains)}</div>`;
           }
@@ -622,7 +673,7 @@
       const expires = document.getElementById('expires').value;
 
       try {
-        const res = await fetch('/api/licenses', {
+        const res = await fetchWithAuth('/api/licenses', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, plan, sites, domain, expires })
@@ -743,7 +794,7 @@
       if (reason === null) return;
 
       try {
-        const res = await fetch(`/api/licenses/${id}/revoke`, {
+        const res = await fetchWithAuth(`/api/licenses/${id}/revoke`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ reason })

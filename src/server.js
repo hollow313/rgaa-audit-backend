@@ -182,8 +182,33 @@ function invalidateCrlCache() {
 }
 
 /* ----------------------------------------------------
-   Web UI Dashboard API
+   Web UI Dashboard API & Admin Security (P0)
 ---------------------------------------------------- */
+
+// Admin authentication middleware for all /api/* routes
+function requireAdminToken(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const token = authHeader.slice(7).trim();
+  const expectedToken = config.adminToken;
+  if (!expectedToken) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const tokenBuf = Buffer.from(token);
+  const expectedBuf = Buffer.from(expectedToken);
+
+  if (tokenBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(tokenBuf, expectedBuf)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  next();
+}
+
+app.use('/api', requireAdminToken);
 
 // Serve index.html on root
 app.get('/', (req, res) => {
@@ -398,29 +423,90 @@ app.post('/v1/activate', applyRateLimiting, (req, res) => {
     }
   }
 
-  // If license ID exists in DB, check revocation status
+  let maxSites = parseInt(payload.sites || 1, 10);
+  let updatedCount = 1;
+
+  // If license ID exists in DB, check revocation status and enforce site quota (P1)
   if (licenseId) {
     const licenseInDb = db.getLicenseById(licenseId);
     if (licenseInDb) {
       if (licenseInDb.status === 'revoked' || licenseInDb.status === 'refunded') {
         return res.status(403).json({ error: 'license_revoked', message: 'License has been revoked' });
       }
+      if (licenseInDb.sites) {
+        maxSites = parseInt(licenseInDb.sites, 10);
+      }
     }
+
+    const currentActivations = db.getActivations(licenseId);
+    const isAlreadyActive = currentActivations.some(a => normalizeDomain(a.domain) === clientDomainNorm);
+
+    // Enforce quota: reject if maxSites reached and domain is not already active (P1)
+    if (!isAlreadyActive && currentActivations.length >= maxSites) {
+      return res.status(409).json({
+        error: 'quota_exceeded',
+        message: `Site quota exceeded (${currentActivations.length}/${maxSites}). Deactivate an existing site before activating a new one.`,
+        activations: currentActivations.length,
+        sites: maxSites
+      });
+    }
+
     // Record activation (without storing IP or User-Agent, U-04)
     db.recordActivation({
       license_id: licenseId,
       domain: clientDomainNorm,
       plugin_version: plugin_version || null
     });
+
+    updatedCount = isAlreadyActive ? currentActivations.length : (currentActivations.length + 1);
   }
 
   const nextUpdate = new Date(Date.now() + config.crlValidityHours * 3600 * 1000).toISOString();
 
+  // Return activation quota info for WordPress plugin (P2)
   res.json({
     valid: true,
+    activations: updatedCount,
+    sites: maxSites,
     plan: payload.plan || 'solo',
     expires: payload.expires,
     next_update: nextUpdate
+  });
+});
+
+// Deactivation (P1: frees an activation slot, with U-05 rate limiting)
+app.post('/v1/deactivate', applyRateLimiting, (req, res) => {
+  const { key, domain } = req.body || {};
+  if (!key || !domain) {
+    return res.status(400).json({ error: 'bad_request', message: 'Missing key or domain' });
+  }
+
+  const verification = verifyLicenseKey(key);
+  if (!verification.valid) {
+    return res.status(403).json({ error: 'invalid_license', message: 'License signature verification failed' });
+  }
+
+  const payload = verification.payload || {};
+  const licenseId = payload.license_id || payload.id;
+  const clientDomainNorm = normalizeDomain(domain);
+  const maxSites = parseInt(payload.sites || 1, 10);
+
+  if (licenseId) {
+    db.deleteActivation(licenseId, clientDomainNorm);
+    const remaining = db.getActivations(licenseId);
+    return res.json({
+      deactivated: true,
+      domain: clientDomainNorm,
+      activations: remaining.length,
+      sites: maxSites
+    });
+  }
+
+  res.json({
+    deactivated: true,
+    domain: clientDomainNorm,
+    activations: 0,
+    sites: maxSites
   });
 });
 
@@ -449,31 +535,33 @@ app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
   const slug = req.params.slug || 'rgaa-audit';
   const key = req.query.key;
 
-  // If key is supplied, verify it
-  if (key) {
-    const verification = verifyLicenseKey(key);
-    if (!verification.valid) {
-      return res.status(403).json({ error: 'invalid_license' });
-    }
+  // Key is required (P2)
+  if (!key) {
+    return res.status(403).json({ error: 'license_key_required' });
+  }
 
-    const payload = verification.payload || {};
-    // Check expiration date
-    if (payload.expires) {
-      const expDate = new Date(payload.expires);
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      if (!isNaN(expDate.getTime()) && expDate < today) {
-        return res.status(403).json({ error: 'license_expired' });
-      }
-    }
+  const verification = verifyLicenseKey(key);
+  if (!verification.valid) {
+    return res.status(403).json({ error: 'invalid_license' });
+  }
 
-    // Check revocation in DB if ID exists
-    const licenseId = payload.license_id || payload.id;
-    if (licenseId) {
-      const licDb = db.getLicenseById(licenseId);
-      if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
-        return res.status(403).json({ error: 'license_revoked' });
-      }
+  const payload = verification.payload || {};
+  // Check expiration date
+  if (payload.expires) {
+    const expDate = new Date(payload.expires);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (!isNaN(expDate.getTime()) && expDate < today) {
+      return res.status(403).json({ error: 'license_expired' });
+    }
+  }
+
+  // Check revocation in DB if ID exists
+  const licenseId = payload.license_id || payload.id;
+  if (licenseId) {
+    const licDb = db.getLicenseById(licenseId);
+    if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
+      return res.status(403).json({ error: 'license_revoked' });
     }
   }
 
