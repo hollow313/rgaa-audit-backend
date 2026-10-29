@@ -146,7 +146,7 @@ function listLicenses(filters = {}, customDb = null) {
   const db = customDb || getDb();
   if (filters.status) {
     const stmt = db.prepare(`
-      SELECT l.*, COUNT(a.domain) as activations_count
+      SELECT l.*, COUNT(DISTINCT a.domain) as activations_count, GROUP_CONCAT(DISTINCT a.domain) as activated_domains
       FROM licenses l
       LEFT JOIN activations a ON a.license_id = l.id
       WHERE l.status = ?
@@ -156,7 +156,7 @@ function listLicenses(filters = {}, customDb = null) {
     return stmt.all(filters.status);
   }
   const stmt = db.prepare(`
-    SELECT l.*, COUNT(a.domain) as activations_count
+    SELECT l.*, COUNT(DISTINCT a.domain) as activations_count, GROUP_CONCAT(DISTINCT a.domain) as activated_domains
     FROM licenses l
     LEFT JOIN activations a ON a.license_id = l.id
     GROUP BY l.id

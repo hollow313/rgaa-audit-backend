@@ -130,9 +130,11 @@ app.get('/api/licenses', (req, res) => {
         });
         key = signed.key;
       }
+      const activations = db.getActivations(lic.id);
       return {
         ...lic,
-        key
+        key,
+        activations
       };
     });
     res.json(licensesWithKeys);

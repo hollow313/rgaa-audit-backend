@@ -526,6 +526,15 @@
         const activationsCount = lic.activations_count || 0;
         const isExpanded = expandedRowId === lic.id;
 
+        let activationsBadge = `<span style="color:var(--text-muted); font-size:0.8125rem;">0 site</span>`;
+        if (activationsCount > 0) {
+          const domsTitle = lic.activated_domains ? `Activé sur : ${lic.activated_domains}` : '';
+          activationsBadge = `<span class="badge badge-success" title="${escapeHtml(domsTitle)}">✓ ${activationsCount} site(s)</span>`;
+          if (lic.activated_domains) {
+            activationsBadge += `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.2rem; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(lic.activated_domains)}">${escapeHtml(lic.activated_domains)}</div>`;
+          }
+        }
+
         let mainRow = `
           <tr>
             <td><span class="badge ${badgeClass}">${statusLabel}</span></td>
@@ -533,7 +542,7 @@
             <td><span class="badge badge-warning">${escapeHtml(lic.plan)}</span></td>
             <td>${escapeHtml(lic.email)}</td>
             <td>${escapeHtml(lic.expires_at)}</td>
-            <td>${activationsCount} site(s)</td>
+            <td>${activationsBadge}</td>
             <td>
               <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
                 <button class="btn-primary btn-sm" onclick="copyKeyById('${escapeHtml(lic.id)}', this)">📋 Copier</button>
@@ -652,6 +661,25 @@
       const isRevoked = lic.status === 'revoked' || lic.status === 'refunded';
       const statusText = isRevoked ? '❌ Révoquée' : '✅ Active';
 
+      const activations = lic.activations || [];
+      let activationsHtml = '';
+      if (activations.length === 0) {
+        activationsHtml = `
+          <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.45; margin-top:0.4rem;">
+            <em>Aucun site n'a encore envoyé d'appel d'enregistrement au serveur.</em><br>
+            💡 <strong>Pourquoi ?</strong> Le plugin WordPress valide d'abord la clé <strong>100% hors-ligne</strong> dès qu'elle est collée.<br>
+            L'enregistrement réseau côté serveur s'exécute ensuite automatiquement en arrière-plan via le cron WordPress quotidien (toutes les 24h).
+          </div>
+        `;
+      } else {
+        activationsHtml = '<ul style="list-style:none; padding:0; margin:0.5rem 0 0 0; font-size:0.8125rem;">' + activations.map(a => `
+          <li style="display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; border-bottom:1px solid rgba(255,255,255,0.06);">
+            <span style="color:#fff; font-weight:600;">🌐 ${escapeHtml(a.domain)}</span>
+            <span style="color:var(--text-muted); font-size:0.75rem;">Vu le : ${new Date(a.last_seen).toLocaleDateString('fr-FR', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' })}</span>
+          </li>
+        `).join('') + '</ul>';
+      }
+
       document.getElementById('modal-meta-grid').innerHTML = `
         <div class="meta-item"><span>Domaine</span><span>${escapeHtml(lic.domain)}</span></div>
         <div class="meta-item"><span>Plan</span><span>${escapeHtml(lic.plan)} (${lic.sites} site(s))</span></div>
@@ -659,6 +687,13 @@
         <div class="meta-item"><span>Statut</span><span>${statusText}</span></div>
         <div class="meta-item" style="grid-column: 1 / -1;"><span>Email client</span><span>${escapeHtml(lic.email)}</span></div>
         <div class="meta-item" style="grid-column: 1 / -1;"><span>ID Licence</span><code style="font-size:0.75rem; color:#94a3b8;">${escapeHtml(lic.id)}</code></div>
+        <div class="meta-item" style="grid-column: 1 / -1; border-top: 1px solid var(--surface-border); padding-top: 0.75rem; margin-top: 0.25rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
+            <span>Sites WordPress connectés (${activations.length}) :</span>
+            <button class="btn-secondary btn-sm" onclick="simulateActivation('${escapeHtml(lic.key)}')">⚡ Simuler une activation WordPress</button>
+          </div>
+          ${activationsHtml}
+        </div>
       `;
 
       const textarea = document.getElementById('modal-key-textarea');
@@ -670,6 +705,37 @@
         textarea.focus();
         textarea.select();
       }, 50);
+    }
+
+    async function simulateActivation(key) {
+      const domain = prompt('Entrez le nom de domaine WordPress à enregistrer (ex: mon-site-client.fr) :', 'mon-site-client.fr');
+      if (!domain) return;
+
+      try {
+        const res = await fetch('/v1/activate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            key: key,
+            domain: domain,
+            plugin_version: '0.2.0'
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`✅ Domaine « ${domain} » activé avec succès !`);
+          await loadData();
+          const updatedLic = allLicenses.find(l => l.key === key);
+          if (updatedLic) {
+            showKeyDetails(updatedLic, `Détails Licence : ${updatedLic.domain}`);
+          }
+        } else {
+          alert('Erreur activation: ' + (data.message || data.error));
+        }
+      } catch (err) {
+        alert('Erreur réseau: ' + err.message);
+      }
     }
 
     async function handleRevoke(id) {
