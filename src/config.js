@@ -41,7 +41,8 @@ const config = {
   smtpUrl: process.env.SMTP_URL || '',
   smtpFrom: process.env.SMTP_FROM || 'licenses@exemple.fr',
   crlValidityHours: parseInt(process.env.CRL_VALIDITY_HOURS || '24', 10),
-  releasesDir: process.env.RELEASES_DIR || path.join(keysDir, 'releases')
+  releasesDir: process.env.RELEASES_DIR || path.join(keysDir, 'releases'),
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || 'https://updates.rgaa-audit.eu'
 };
 
 module.exports = config;

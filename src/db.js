@@ -56,7 +56,10 @@ function initSchema(db) {
       created_at    TEXT NOT NULL,
       revoked_at    TEXT,
       revoke_reason TEXT,
-      signed_key    TEXT
+      signed_key    TEXT,
+      emailed_at    TEXT,
+      mail_attempts INTEGER NOT NULL DEFAULT 0,
+      mail_last_error TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_provider_ref ON licenses(provider, provider_ref);
 
@@ -100,6 +103,15 @@ function initSchema(db) {
     db.exec('ALTER TABLE licenses ADD COLUMN auto_renew INTEGER NOT NULL DEFAULT 1;');
   } catch {}
   try {
+    db.exec('ALTER TABLE licenses ADD COLUMN emailed_at TEXT;');
+  } catch {}
+  try {
+    db.exec('ALTER TABLE licenses ADD COLUMN mail_attempts INTEGER NOT NULL DEFAULT 0;');
+  } catch {}
+  try {
+    db.exec('ALTER TABLE licenses ADD COLUMN mail_last_error TEXT;');
+  } catch {}
+  try {
     db.exec("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'received';");
   } catch {}
   try {
@@ -129,8 +141,8 @@ function createLicense(data, customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`
     INSERT INTO licenses (
-      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, auto_renew, created_at, signed_key
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, auto_renew, created_at, signed_key, emailed_at, mail_attempts, mail_last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     data.id,
@@ -144,9 +156,42 @@ function createLicense(data, customDb = null) {
     data.provider_ref || null,
     data.auto_renew !== undefined ? (data.auto_renew ? 1 : 0) : 1,
     data.created_at || new Date().toISOString(),
-    data.signed_key || null
+    data.signed_key || null,
+    data.emailed_at || null,
+    data.mail_attempts || 0,
+    data.mail_last_error || null
   );
   return getLicenseById(data.id, db);
+}
+
+function updateLicenseMailStatus(id, { success, error = null }, customDb = null) {
+  const db = customDb || getDb();
+  const now = new Date().toISOString();
+  if (success) {
+    const stmt = db.prepare(`
+      UPDATE licenses
+      SET emailed_at = ?,
+          mail_attempts = mail_attempts + 1,
+          mail_last_error = NULL
+      WHERE id = ?
+    `);
+    stmt.run(now, id);
+  } else {
+    const stmt = db.prepare(`
+      UPDATE licenses
+      SET mail_attempts = mail_attempts + 1,
+          mail_last_error = ?
+      WHERE id = ?
+    `);
+    stmt.run(error ? String(error).slice(0, 500) : 'unknown_error', id);
+  }
+  return getLicenseById(id, db);
+}
+
+function getLicenseByEmail(email, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('SELECT * FROM licenses WHERE email = ? ORDER BY created_at DESC LIMIT 1');
+  return stmt.get(email);
 }
 
 function setAutoRenew(id, autoRenew = 0, customDb = null) {
@@ -221,7 +266,40 @@ function getLicenseStats(customDb = null) {
   const active = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE status = 'active'").get()?.count || 0;
   const revoked = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE status IN ('revoked', 'refunded')").get()?.count || 0;
   const activations = db.prepare('SELECT COUNT(*) as count FROM activations').get()?.count || 0;
-  return { total, active, revoked, activations };
+  const emails_pending = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE emailed_at IS NULL AND mail_attempts = 0").get()?.count || 0;
+  const emails_failed = db.prepare("SELECT COUNT(*) as count FROM licenses WHERE emailed_at IS NULL AND mail_attempts > 0").get()?.count || 0;
+  return { total, active, revoked, activations, emails_pending, emails_failed };
+}
+
+function deleteLicense(id, customDb = null) {
+  const db = customDb || getDb();
+  db.prepare('DELETE FROM activations WHERE license_id = ?').run(id);
+  const result = db.prepare('DELETE FROM licenses WHERE id = ?').run(id);
+  return result.changes > 0;
+}
+
+function purgeLicenses(filter = 'test', customDb = null) {
+  const db = customDb || getDb();
+  let whereClause = '';
+  if (filter === 'test') {
+    whereClause = "WHERE email LIKE '%@example.com' OR email LIKE '%@test.local' OR provider = 'manual' OR provider_ref IS NULL";
+  } else if (filter === 'revoked') {
+    whereClause = "WHERE status IN ('revoked', 'refunded')";
+  } else if (filter === 'all') {
+    whereClause = '';
+  } else {
+    throw new Error('invalid_filter');
+  }
+
+  const rows = db.prepare(`SELECT id FROM licenses ${whereClause}`).all();
+  if (rows.length === 0) return 0;
+
+  const ids = rows.map(r => r.id);
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`DELETE FROM activations WHERE license_id IN (${placeholders})`).run(...ids);
+  const delStmt = db.prepare(`DELETE FROM licenses WHERE id IN (${placeholders})`);
+  const info = delStmt.run(...ids);
+  return typeof info?.changes === 'number' ? info.changes : ids.length;
 }
 
 function recordActivation({ license_id, domain, plugin_version }, customDb = null) {
@@ -408,8 +486,12 @@ module.exports = {
   initSchema,
   createLicense,
   getLicenseById,
+  getLicenseByEmail,
   getLicenseByProviderRef,
   updateLicenseStatus,
+  updateLicenseMailStatus,
+  deleteLicense,
+  purgeLicenses,
   setAutoRenew,
   updateLicenseExpires,
   listLicenses,

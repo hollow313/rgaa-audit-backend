@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const app = require('../src/server');
 const db = require('../src/db');
 const config = require('../src/config');
+const mailer = require('../src/mailer');
 const { signLicense, initKeypair, verifyLicenseKey } = require('../src/crypto');
 
 function makeWebhookHeaders(provider, payload, secret, options = {}) {
@@ -45,6 +46,7 @@ describe('API Endpoints', () => {
     config.adminToken = 'test_admin_token_secret_12345';
     config.polarWebhookSecret = 'test_polar_secret_key_12345';
     config.paddleWebhookSecret = 'test_paddle_secret_key_12345';
+    mailer.setMockTransporter({ sendMail: async () => ({ messageId: 'mock-id' }) });
     initKeypair();
     db.getDb();
     server = http.createServer(app);
@@ -58,6 +60,7 @@ describe('API Endpoints', () => {
   });
 
   after(async () => {
+    mailer.setMockTransporter(null);
     await new Promise((resolve) => server.close(resolve));
   });
 
@@ -157,12 +160,30 @@ describe('API Endpoints', () => {
     assert.ok(typeof stats.active === 'number');
   });
 
-  it('GET /healthz returns ok and db status when webhook secrets configured', async () => {
+  it('GET /healthz returns ok, db status and mail: true when configured', async () => {
     const res = await fetch(`${baseUrl}/healthz`);
     assert.equal(res.status, 200);
     const data = await res.json();
     assert.equal(data.ok, true);
     assert.equal(data.db, true);
+    assert.equal(data.mail, true);
+  });
+
+  it('GET /healthz returns mail: false when SMTP is not configured (without returning 503)', async () => {
+    mailer.setMockTransporter(null);
+    const prevUrl = config.smtpUrl;
+    config.smtpUrl = '';
+    try {
+      const res = await fetch(`${baseUrl}/healthz`);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.ok, true);
+      assert.equal(data.db, true);
+      assert.equal(data.mail, false);
+    } finally {
+      config.smtpUrl = prevUrl;
+      mailer.setMockTransporter({ sendMail: async () => ({ messageId: 'mock-id' }) });
+    }
   });
 
   it('GET /healthz returns 503 webhook_secret_missing when secrets are not configured', async () => {
@@ -469,7 +490,7 @@ describe('API Endpoints', () => {
       id: eventId,
       type: 'order.paid',
       data: {
-        customer_email: 'buyer@test.org',
+        customer: { email: 'buyer@test.org' },
         plan: 'solo',
         sites: 1,
         domain: 'polar-test.org',
@@ -510,7 +531,7 @@ describe('API Endpoints', () => {
         id: eventId,
         type: 'order.paid',
         data: {
-          customer_email: 'buyer-sw@test.org',
+          customer: { email: 'buyer-sw@test.org' },
           plan: 'solo',
           sites: 1,
           domain: 'standardwebhooks.org',
@@ -1102,5 +1123,204 @@ describe('API Endpoints', () => {
 
     assert.equal(got429, true, 'The 11th request to /api/* must receive HTTP 429');
     assert.equal(retryAfterHeader, '60');
+    app.resetRateLimits();
+  });
+
+  /* ----------------------------------------------------
+     M-01 Tests: Email Delivery Tracking, Failure Retries & Resend
+  ---------------------------------------------------- */
+  it('M-01: Two successive POSTs of same webhook-id with broken SMTP produce a single license, mail_attempts = 2, emailed_at null, and two 5xx responses', async () => {
+    mailer.setMockTransporter({
+      sendMail: async () => {
+        throw new Error('EAUTH: Invalid login');
+      }
+    });
+
+    const eventId = 'evt_broken_smtp_' + Date.now();
+    const orderId = 'ord_broken_smtp_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        customer: { email: 'loic.huon.automation@gmail.com' },
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7', // Solo
+        domain: 'broken-mail.fr',
+        order_id: orderId
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+
+    // First attempt -> 500 mail_delivery_failed
+    const res1 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res1.status, 500);
+    const b1 = await res1.json();
+    assert.equal(b1.error, 'mail_delivery_failed');
+
+    // Second attempt (Polar retry) -> 500
+    const res2 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res2.status, 500);
+
+    // Exactly one license in DB, mail_attempts = 2, emailed_at null
+    const lics = db.getDb().prepare("SELECT * FROM licenses WHERE email = 'loic.huon.automation@gmail.com' AND provider_ref = ?").all(orderId);
+    assert.equal(lics.length, 1, 'Must create only ONE license across retries');
+    assert.equal(lics[0].mail_attempts, 2);
+    assert.equal(lics[0].emailed_at, null);
+    assert.ok(lics[0].mail_last_error.includes('EAUTH'));
+
+    // SMTP fixed: 3rd retry succeeds
+    mailer.setMockTransporter({ sendMail: async () => ({ messageId: 'fixed-msg' }) });
+    const res3 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res3.status, 200);
+    const b3 = await res3.json();
+    assert.equal(b3.status, 'license_issued');
+
+    const licsAfterFix = db.getDb().prepare("SELECT * FROM licenses WHERE email = 'loic.huon.automation@gmail.com' AND provider_ref = ?").all(orderId);
+    assert.equal(licsAfterFix.length, 1, 'Still only 1 license');
+    assert.ok(licsAfterFix[0].emailed_at !== null, 'emailed_at must now be set');
+
+    // 4th replay: already processed
+    const res4 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res4.status, 200);
+    const b4 = await res4.json();
+    assert.equal(b4.status, 'already_processed');
+  });
+
+  it('M-01: POST /v1/resend-key resends email without creating new license', async () => {
+    const licId = 'lic_resend_' + Date.now();
+    db.createLicense({
+      id: licId,
+      email: 'resend-client@domain.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'resend.fr',
+      expires_at: '2028-10-10',
+      status: 'active',
+      signed_key: 'signed.key.test'
+    });
+
+    const res = await fetch(`${baseUrl}/v1/resend-key`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: JSON.stringify({ license_id: licId })
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.sent, true);
+    assert.equal(body.license_id, licId);
+
+    const updated = db.getLicenseById(licId);
+    assert.ok(updated.emailed_at !== null);
+  });
+
+  it('M-01: /api/stats exposes emails_pending and emails_failed', async () => {
+    const res = await fetch(`${baseUrl}/api/stats`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
+    assert.equal(res.status, 200);
+    const stats = await res.json();
+    assert.ok(typeof stats.emails_pending === 'number');
+    assert.ok(typeof stats.emails_failed === 'number');
+  });
+
+  /* ----------------------------------------------------
+     M-02 Tests: License Deletion & Purge
+  ---------------------------------------------------- */
+  it('M-02: DELETE /api/licenses/:id deletes license, returns 204 and removes from CRL', async () => {
+    const licId = 'lic_delete_test_' + Date.now();
+    db.createLicense({
+      id: licId,
+      email: 'delete-me@test.local',
+      plan: 'solo',
+      sites: 1,
+      domain: 'delete-me.fr',
+      expires_at: '2028-10-10',
+      status: 'revoked'
+    });
+
+    const delRes = await fetch(`${baseUrl}/api/licenses/${licId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
+    assert.equal(delRes.status, 204);
+
+    assert.equal(db.getLicenseById(licId), undefined);
+
+    const crlRes = await fetch(`${baseUrl}/v1/crl`);
+    const crlBody = await crlRes.json();
+    const crlData = JSON.parse(Buffer.from(crlBody.payload, 'base64url').toString('utf8'));
+    assert.ok(!crlData.revoked.some(r => r.id === licId));
+  });
+
+  it('M-02: POST /api/licenses/purge with filter test purges test licenses and /v1/updates returns 403 invalid_license', async () => {
+    const testLicId = 'test_purge_' + Date.now();
+    const signed = signLicense({
+      id: testLicId,
+      license_id: testLicId,
+      plan: 'solo',
+      sites: 1,
+      domain: 'test-purge.local',
+      expires: '2029-12-31'
+    });
+    db.createLicense({
+      id: testLicId,
+      email: 'auto-test@example.com',
+      plan: 'solo',
+      sites: 1,
+      domain: 'test-purge.local',
+      expires_at: '2029-12-31',
+      status: 'active',
+      provider: 'manual',
+      signed_key: signed.key
+    });
+
+    // Reject without confirm 'PURGE'
+    const rejRes = await fetch(`${baseUrl}/api/licenses/purge`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: JSON.stringify({ confirm: 'NO', filter: 'test' })
+    });
+    assert.equal(rejRes.status, 400);
+
+    // Confirm PURGE
+    const purgeRes = await fetch(`${baseUrl}/api/licenses/purge`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.adminToken}`
+      },
+      body: JSON.stringify({ confirm: 'PURGE', filter: 'test' })
+    });
+    assert.equal(purgeRes.status, 200);
+    const purgeBody = await purgeRes.json();
+    assert.ok(purgeBody.purged >= 1);
+
+    // Deleted key -> /v1/updates returns 403 invalid_license
+    const updRes = await fetch(`${baseUrl}/v1/updates?key=${signed.key}`);
+    assert.equal(updRes.status, 403);
+    const updBody = await updRes.json();
+    assert.equal(updBody.error, 'invalid_license');
   });
 });

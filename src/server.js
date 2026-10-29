@@ -13,7 +13,7 @@ const {
   initKeypair,
   checkKeypair
 } = require('./crypto');
-const { sendLicenseEmail } = require('./mailer');
+const { sendLicenseEmail, getMailHealth, getLastMailError } = require('./mailer');
 
 const app = express();
 app.disable('x-powered-by');
@@ -421,6 +421,38 @@ app.post('/api/licenses/:id/revoke', (req, res) => {
   }
 });
 
+// Delete single license from Web UI (M-02)
+app.delete('/api/licenses/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = db.deleteLicense(id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Licence introuvable' });
+    }
+    invalidateCrlCache();
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Purge licenses from Web UI (M-02)
+app.post('/api/licenses/purge', (req, res) => {
+  try {
+    const { confirm, filter } = req.body || {};
+    if (confirm !== 'PURGE') {
+      return res.status(400).json({ error: 'invalid_confirmation', message: 'confirm must be PURGE' });
+    }
+    const allowed = ['test', 'revoked', 'all'];
+    const selectedFilter = allowed.includes(filter) ? filter : 'test';
+    const count = db.purgeLicenses(selectedFilter);
+    invalidateCrlCache();
+    res.json({ purged: count, filter: selectedFilter });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Shared licenses for dashboard alerts
 app.get('/api/shared', (req, res) => {
   try {
@@ -469,7 +501,7 @@ app.get('/healthz', (req, res) => {
       return res.status(503).json({ ok: false });
     }
 
-    res.json({ ok: true, db: isDbOk });
+    res.json({ ok: true, db: isDbOk, mail: getMailHealth() });
   } catch (err) {
     res.status(500).json({ error: 'internal' });
   }
@@ -609,6 +641,43 @@ app.post('/v1/deactivate', applyActivateRateLimiting, (req, res) => {
   });
 });
 
+// Resend license key email (M-01: requires ADMIN_TOKEN)
+app.post('/v1/resend-key', async (req, res) => {
+  if (!checkAdminToken(req)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { license_id, id, email } = req.body || {};
+  const targetId = license_id || id;
+  let lic = null;
+  if (targetId) {
+    lic = db.getLicenseById(targetId);
+  } else if (email) {
+    lic = db.getLicenseByEmail(email);
+  }
+
+  if (!lic) {
+    return res.status(404).json({ error: 'license_not_found' });
+  }
+
+  const mailResult = await sendLicenseEmail({
+    to: lic.email,
+    plan: lic.plan,
+    domain: lic.domain,
+    expires: lic.expires_at,
+    key: lic.signed_key
+  });
+
+  if (mailResult && mailResult.success) {
+    db.updateLicenseMailStatus(lic.id, { success: true });
+    return res.status(200).json({ sent: true, license_id: lic.id, email: lic.email });
+  } else {
+    const errMsg = mailResult?.error || 'smtp_send_failed';
+    db.updateLicenseMailStatus(lic.id, { success: false, error: errMsg });
+    return res.status(200).json({ sent: false, error: errMsg, license_id: lic.id, email: lic.email });
+  }
+});
+
 // CRL (Certificate Revocation List) — B-02 stable cache & 304 handling
 app.get('/v1/crl', (req, res) => {
   const crl = getCachedCrl();
@@ -655,11 +724,14 @@ app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
     }
   }
 
-  // Check revocation in DB if ID exists
+  // Check existence and revocation in DB if ID exists
   const licenseId = payload.license_id || payload.id;
   if (licenseId) {
     const licDb = db.getLicenseById(licenseId);
-    if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
+    if (!licDb) {
+      return res.status(403).json({ error: 'invalid_license' });
+    }
+    if (licDb.status === 'revoked' || licDb.status === 'refunded') {
       return res.status(403).json({ error: 'license_revoked' });
     }
   }
@@ -717,11 +789,14 @@ app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
     }
   }
 
-  // Check revocation in DB if ID exists
+  // Check existence and revocation in DB if ID exists
   const licenseId = payload.license_id || payload.id;
   if (licenseId) {
     const licDb = db.getLicenseById(licenseId);
-    if (licDb && (licDb.status === 'revoked' || licDb.status === 'refunded')) {
+    if (!licDb) {
+      return res.status(403).json({ error: 'invalid_license' });
+    }
+    if (licDb.status === 'revoked' || licDb.status === 'refunded') {
       return res.status(403).json({ error: 'license_revoked' });
     }
   }
@@ -908,14 +983,19 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       db.updateLicenseExpires(lic.id, newExpires, signed.key);
 
       // Send renewal email to client
-      sendLicenseEmail({
+      const mailResult = await sendLicenseEmail({
         to: lic.email,
         plan: lic.plan,
         domain: lic.domain,
         expires: newExpires,
         key: signed.key,
         isRenewal: true
-      }).catch(err => console.error(`[webhook] Renewal mail error: ${err.message}`));
+      });
+      if (mailResult && mailResult.success) {
+        db.updateLicenseMailStatus(lic.id, { success: true });
+      } else {
+        db.updateLicenseMailStatus(lic.id, { success: false, error: mailResult?.error });
+      }
 
       db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'license_renewed', id: lic.id, key: signed.key, expires: newExpires });
@@ -923,10 +1003,37 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
 
     // 2. Initial purchase: subscription.created or order.paid
     if (eventType === 'subscription.created' || eventType === 'order.paid') {
-      const email = data?.customer?.email || data?.customer_email || data?.email || '';
+      const email = data?.customer?.email || '';
       if (!email) {
         db.markEventFailed(eventId, 'missing_customer_email');
         return res.status(422).json({ error: 'missing_customer_email' });
+      }
+
+      const providerRef = data.subscription_id || data.order_id || data.id || eventId;
+      const existingLic = db.getLicenseByProviderRef('polar', providerRef);
+      if (existingLic) {
+        if (existingLic.emailed_at) {
+          db.markEventProcessed(eventId);
+          return res.status(200).json({ status: 'already_processed', id: existingLic.id });
+        }
+        // Exists with emailed_at null -> retry sending email
+        const mailResult = await sendLicenseEmail({
+          to: existingLic.email,
+          plan: existingLic.plan,
+          domain: existingLic.domain,
+          expires: existingLic.expires_at,
+          key: existingLic.signed_key
+        });
+        if (mailResult && mailResult.success) {
+          db.updateLicenseMailStatus(existingLic.id, { success: true });
+          db.markEventProcessed(eventId);
+          return res.status(200).json({ status: 'license_issued', id: existingLic.id, key: existingLic.signed_key });
+        } else {
+          const errMsg = mailResult?.error || 'smtp_send_failed';
+          db.updateLicenseMailStatus(existingLic.id, { success: false, error: errMsg });
+          db.markEventFailed(eventId, errMsg);
+          return res.status(500).json({ error: 'mail_delivery_failed', message: errMsg, id: existingLic.id });
+        }
       }
 
       const productId = data?.product_id || data?.product?.id;
@@ -957,21 +1064,6 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       const nowIso = new Date().toISOString();
       const normalizedDomain = normalizeDomain(domain);
 
-      // Transactional insertion: INSERT first
-      db.createLicense({
-        id: licenseId,
-        email,
-        plan,
-        sites,
-        domain: normalizedDomain,
-        expires_at: expires,
-        provider: 'polar',
-        provider_ref: data.subscription_id || data.order_id || eventId,
-        auto_renew: 1,
-        status: 'active',
-        created_at: nowIso
-      });
-
       // Sign key
       const payload = {
         id: licenseId,
@@ -983,20 +1075,44 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       };
       const signed = signLicense(payload);
 
-      // Store signed_key
-      db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
+      // Transactional insertion: INSERT first (emailed_at = null, mail_attempts = 0)
+      db.createLicense({
+        id: licenseId,
+        email,
+        plan,
+        sites,
+        domain: normalizedDomain,
+        expires_at: expires,
+        provider: 'polar',
+        provider_ref: providerRef,
+        auto_renew: 1,
+        status: 'active',
+        created_at: nowIso,
+        signed_key: signed.key,
+        emailed_at: null,
+        mail_attempts: 0,
+        mail_last_error: null
+      });
 
-      // Send email
-      sendLicenseEmail({
+      // Send email (strict delivery check)
+      const mailResult = await sendLicenseEmail({
         to: email,
         plan,
         domain,
         expires,
         key: signed.key
-      }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
+      });
 
-      db.markEventProcessed(eventId);
-      return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
+      if (mailResult && mailResult.success) {
+        db.updateLicenseMailStatus(licenseId, { success: true });
+        db.markEventProcessed(eventId);
+        return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
+      } else {
+        const errMsg = mailResult?.error || 'smtp_send_failed';
+        db.updateLicenseMailStatus(licenseId, { success: false, error: errMsg });
+        db.markEventFailed(eventId, errMsg);
+        return res.status(500).json({ error: 'mail_delivery_failed', message: errMsg, id: licenseId });
+      }
     }
 
     // 3. Cancellation (auto_renew disabled, leaves license active until expires)
@@ -1089,16 +1205,24 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
 
       db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
 
-      sendLicenseEmail({
+      const mailResult = await sendLicenseEmail({
         to: email,
         plan,
         domain,
         expires,
         key: signed.key
-      }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
+      });
 
-      db.markEventProcessed(eventId);
-      return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
+      if (mailResult && mailResult.success) {
+        db.updateLicenseMailStatus(licenseId, { success: true });
+        db.markEventProcessed(eventId);
+        return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
+      } else {
+        const errMsg = mailResult?.error || 'smtp_send_failed';
+        db.updateLicenseMailStatus(licenseId, { success: false, error: errMsg });
+        db.markEventFailed(eventId, errMsg);
+        return res.status(500).json({ error: 'mail_delivery_failed', message: errMsg, id: licenseId });
+      }
     }
 
     if (eventType === 'subscription.canceled' || eventType === 'adjustment.created') {
@@ -1258,5 +1382,12 @@ if (require.main === module) {
   });
 }
 
+app.resetRateLimits = () => {
+  apiLimits.clear();
+  keyLimits.clear();
+  ipLimits.clear();
+};
+
 module.exports = app;
 module.exports.invalidateCrlCache = invalidateCrlCache;
+module.exports.resetRateLimits = app.resetRateLimits;

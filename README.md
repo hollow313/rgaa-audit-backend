@@ -106,6 +106,7 @@ docker run -d \
 | `EVENTS_RETENTION_DAYS` | `90` | Rétention RGPD des événements de paiement pour l'idempotence (en jours, min. 7) |
 | `SMTP_URL` | *(vide)* | URL SMTP pour l'envoi des clés par email (`smtp://user:pass@host:587`) |
 | `SMTP_FROM` | `licenses@exemple.fr` | Adresse d'expéditeur des emails transactionnels |
+| `PUBLIC_BASE_URL` | `https://updates.rgaa-audit.eu` | URL publique de base utilisée dans les emails de livraison de clé |
 | `CRL_VALIDITY_HOURS` | `24` | Durée de validité de la CRL avant régénération du cache |
 
 ---

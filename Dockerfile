@@ -45,7 +45,7 @@ USER 568:568
 
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://127.0.0.1:30019/healthz || exit 1
+  CMD curl -f http://127.0.0.1:${PORT:-30019}/healthz || exit 1
 
 # Start license server
 CMD ["node", "src/server.js"]
