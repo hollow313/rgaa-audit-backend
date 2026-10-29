@@ -61,27 +61,13 @@ describe('API Endpoints', () => {
     await new Promise((resolve) => server.close(resolve));
   });
 
-  it('GET / rejects unauthenticated request with 401 and WWW-Authenticate header', async () => {
+  it('GET / returns HTML dashboard with clean token unlock modal (no basic auth dialog)', async () => {
     const res = await fetch(`${baseUrl}/`);
-    assert.equal(res.status, 401);
-    assert.ok(res.headers.get('www-authenticate')?.includes('Basic'));
-  });
-
-  it('GET / with valid ADMIN_TOKEN query parameter returns HTML dashboard', async () => {
-    const res = await fetch(`${baseUrl}/?token=${config.adminToken}`);
     assert.equal(res.status, 200);
+    assert.equal(res.headers.get('www-authenticate'), null, 'Must NOT send WWW-Authenticate header to avoid browser user/password dialog');
     const html = await res.text();
-    assert.ok(html.includes('RGAA Audit'));
-    assert.ok(html.includes('licenses-table'));
-  });
-
-  it('GET / with valid Authorization Bearer header returns HTML dashboard', async () => {
-    const res = await fetch(`${baseUrl}/`, {
-      headers: { 'Authorization': `Bearer ${config.adminToken}` }
-    });
-    assert.equal(res.status, 200);
-    const html = await res.text();
-    assert.ok(html.includes('RGAA Audit'));
+    assert.ok(html.includes('admin-login-modal'));
+    assert.ok(html.includes('login-token-input'));
   });
 
   it('P0: Web UI API: POST /api/licenses rejects unauthenticated call with 401', async () => {
@@ -540,6 +526,176 @@ describe('API Endpoints', () => {
     }
   });
 
+  it('P0: POST /v1/webhook/polar reads nested customer.email and maps Agence product to 10 sites', async () => {
+    const eventId = 'evt_agence_' + Date.now();
+    const payload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        customer: { email: 'agence-client@entreprise.fr' },
+        product_id: '6ae706ed-6bf4-40c1-85d7-dd65b9455984',
+        domain: 'agence-site.com',
+        order_id: 'ord_ag_' + Date.now()
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'license_issued');
+
+    const lic = db.getLicenseById(body.id);
+    assert.equal(lic.email, 'agence-client@entreprise.fr');
+    assert.equal(lic.plan, 'agence');
+    assert.equal(lic.sites, 10);
+  });
+
+  it('P0: POST /v1/webhook/polar rejects missing customer email with 422', async () => {
+    const payload = {
+      id: 'evt_no_email_' + Date.now(),
+      type: 'order.paid',
+      data: {
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7',
+        order_id: 'ord_no_email'
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 422);
+    const body = await res.json();
+    assert.equal(body.error, 'missing_customer_email');
+  });
+
+  it('P0: POST /v1/webhook/polar subscription.canceled sets auto_renew=0 without revoking license', async () => {
+    const licId = 'lic_sub_cancel_' + Date.now();
+    const subId = 'sub_polar_' + Date.now();
+    db.createLicense({
+      id: licId,
+      email: 'sub@test.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'sub.fr',
+      expires_at: '2028-10-30',
+      status: 'active',
+      provider: 'polar',
+      provider_ref: subId,
+      auto_renew: 1
+    });
+
+    const payload = {
+      id: 'evt_cancel_' + Date.now(),
+      type: 'subscription.canceled',
+      data: {
+        id: subId,
+        subscription_id: subId
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'auto_renew_disabled');
+
+    const updatedLic = db.getLicenseById(licId);
+    assert.equal(updatedLic.auto_renew, 0);
+    assert.equal(updatedLic.status, 'active', 'Cancellation must NOT revoke license');
+  });
+
+  it('P0: POST /v1/webhook/polar order.refunded revokes license immediately', async () => {
+    const licId = 'lic_refund_' + Date.now();
+    const orderId = 'ord_ref_' + Date.now();
+    db.createLicense({
+      id: licId,
+      email: 'refund@test.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'refund.fr',
+      expires_at: '2028-10-30',
+      status: 'active',
+      provider: 'polar',
+      provider_ref: orderId
+    });
+
+    const payload = {
+      id: 'evt_ref_' + Date.now(),
+      type: 'order.refunded',
+      data: {
+        id: orderId,
+        order_id: orderId
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'license_revoked');
+
+    const updatedLic = db.getLicenseById(licId);
+    assert.equal(updatedLic.status, 'revoked');
+  });
+
+  it('P1: POST /v1/webhook/polar subscription.cycled extends license expiration date', async () => {
+    const licId = 'lic_cycle_' + Date.now();
+    const subId = 'sub_cycle_' + Date.now();
+    db.createLicense({
+      id: licId,
+      email: 'renew@test.fr',
+      plan: 'solo',
+      sites: 1,
+      domain: 'renew.fr',
+      expires_at: '2027-10-30',
+      status: 'active',
+      provider: 'polar',
+      provider_ref: subId
+    });
+
+    const payload = {
+      id: 'evt_cycle_' + Date.now(),
+      type: 'subscription.cycled',
+      data: {
+        id: subId,
+        subscription_id: subId,
+        subscription: {
+          current_period_end: '2028-10-30T12:00:00Z'
+        }
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', payload, config.polarWebhookSecret);
+    const res = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'license_renewed');
+    assert.equal(body.expires, '2028-10-30');
+
+    const updatedLic = db.getLicenseById(licId);
+    assert.equal(updatedLic.expires_at, '2028-10-30');
+  });
+
   it('P0: POST /v1/webhook/paddle enforces HMAC and accepts valid signature', async () => {
     const payload = {
       event_id: 'pdl_evt_' + Date.now(),
@@ -819,6 +975,25 @@ describe('API Endpoints', () => {
     }
 
     assert.equal(got429, true, 'The 11th request should receive HTTP 429');
+    assert.equal(retryAfterHeader, '60');
+  });
+
+  it('P0: Rate limiting on /api/* rejects more than 10 requests per minute with 429', async () => {
+    let got429 = false;
+    let retryAfterHeader = null;
+
+    for (let i = 0; i < 11; i++) {
+      const res = await fetch(`${baseUrl}/api/stats`, {
+        headers: { 'Authorization': 'Bearer bad_token_attempt' }
+      });
+      if (res.status === 429) {
+        got429 = true;
+        retryAfterHeader = res.headers.get('retry-after');
+        break;
+      }
+    }
+
+    assert.equal(got429, true, 'The 11th request to /api/* must receive HTTP 429');
     assert.equal(retryAfterHeader, '60');
   });
 });

@@ -628,33 +628,235 @@ envoie `POST /v1/activate {key, domain}`. Vérifié de bout en bout sur l'instan
 Dans le build gratuit, le réglage n'existe pas : aucun appel réseau n'est fait, ce qui préserve
 l'argument de revue wordpress.org.
 
+
+## Recette du 29/10/2026 — 5ᵉ passe : tout est vert
+
+| Point | Preuve |
+|---|---|
+| `/api/*` authentifié | `POST /api/licenses`, `GET /api/licenses`, `GET /api/stats` → **`401`** sans jeton |
+| Quota appliqué | licence solo `sites:1` déjà activée : 2ᵉ et 3ᵉ domaine → **`409 {"error":"quota_exceeded","activations":1,"sites":1}`** |
+| Réactivation idempotente | même domaine rappelé → `200`, compteur inchangé (`activations: 1`) |
+| Désactivation | `POST /v1/deactivate` → `{"deactivated":true,"activations":0}` |
+| Réponse d'activation complète | `{"valid":true,"activations":1,"sites":1,"plan":"solo","expires":…}` |
+| Manifeste protégé | `/v1/updates/rgaa-audit` sans `key` ou avec `key=` → **`403 {"error":"license_key_required"}`** |
+| CRL | signature `Verified OK` après révocation |
+| Webhooks | `401 {"error":"unauthorized"}` |
+
+Le plugin affiche désormais « Site activé : 192.168.1.200 (1/1) ».
+
+### Deux points restants
+
+1. **`GET /` sert le dashboard sans authentification.** Le HTML ne contient aucune donnée (les
+   appels `/api/*` échouent en 401 et le jeton est demandé par `prompt()` puis conservé dans
+   `localStorage`), donc l'exposition est faible. Mais la page contient le formulaire d'émission :
+   la protéger aussi (`<meta http-equiv="refresh">` ou 401) coûte une ligne et évite d'expliquer un
+   jour pourquoi l'URL d'admin est publique.
+
+2. **Le webhook réel n'a jamais été exercé.** Tout ce qui précède teste le rejet et l'émission via
+   `/api/licenses`, pas un événement Polar signé. À faire dès que le compte Polar existe :
+   `polar webhook trigger` (CLI Polar) ou un achat en mode sandbox, puis vérifier que la licence
+   apparaît avec le bon `plan`, le bon quota et un email envoyé. **C'est le seul chemin qui n'a
+   jamais tourné de bout en bout.**
+
+### Rappel de configuration pour la mise en production
+
+- `ADMIN_TOKEN` : chaîne aléatoire longue (`openssl rand -hex 32`), dans l'environnement du conteneur.
+- `PAYMENT_PROVIDERS=polar`, `POLAR_WEBHOOK_SECRET` : sans eux, `/healthz` reste `503` et aucune
+  licence ne peut être émise par un achat.
+- Reverse proxy : ne router que `/v1/*` vers l'extérieur. `/` et `/api/*` restent locaux.
+
+
+## Recette du 29/10/2026 — 6ᵉ passe : avec `ADMIN_TOKEN`
+
+| Test | Résultat |
+|---|---|
+| `GET /api/licenses` + jeton | `200`, 7 licences |
+| `GET /api/stats` + jeton | `{"total":7,"active":4,"revoked":3,"activations":6}` |
+| Jeton faux / absent | `401 {"error":"unauthorized"}` |
+| `/v1/*` sans jeton | fonctionne (API publique, protégée par la clé de licence) |
+| Émission `plan: agence`, `sites: 10` | clé signée, **`Verified OK`** hors ligne |
+| Quota `sites: 2` | `a.fr` → 1/2, `b.fr` → 2/2, `c.fr` → **`409 quota_exceeded (2/2)`** |
+| Révocation + CRL | `/v1/updates` → `403 license_revoked`, activations listées |
+
+### Deux faiblesses restantes
+
+**1. `/api/*` n'a aucune limitation de débit.** 20 tentatives de jeton faux d'affilée → 20 × `401`,
+aucun `429`. Combiné à un jeton court ou deviné (`admin`, `test`, `changeme`), l'authentification
+tombe en quelques secondes. Ajouter un limiteur sur `/api/*` : **10 tentatives par minute et par
+IP**, puis `429` avec `Retry-After`. Le middleware existe déjà pour `/v1/*`, c'est la même fabrique.
+
+**2. La valeur du jeton compte autant que sa présence.** `ADMIN_TOKEN=admin` est acceptable en
+recette locale ; en production, `openssl rand -hex 32`. Un scanner teste `admin` en premier.
+
+**3. `GET /` sert toujours le dashboard sans jeton** (page vide de données, mais le formulaire
+d'émission y est). Une ligne suffit.
+
+
+## Recette du 29/10/2026 — 7ᵉ passe : webhook Polar réel signé (chemin positif)
+
+Le compte Polar existe, l'endpoint est créé (`e9658b0b-…`, `uses_standard_webhook_signature: true`)
+et `POLAR_WEBHOOK_SECRET` est en place (`/healthz` → `200 {"ok":true,"db":true}`). J'ai donc pu
+signer des événements Standard Webhooks valides et les rejouer contre le serveur.
+
+### Validé
+
+| Test | Résultat |
+|---|---|
+| Signature `HMAC(secret, "{webhook-id}.{timestamp}.{body}")` | **`200`** — la vérification Standard Webhooks est correcte |
+| Signature invalide | `401 {"error":"unauthorized"}` |
+| Horodatage vieux de 600 s | `401` |
+| `order.paid` | `200 {"status":"license_issued","id":…,"key":…}`, clé vérifiable hors ligne |
+| Rejeu du même `webhook-id` | `200 already_processed`, aucune duplication |
+| `order.refunded` | licence `revoked`, CRL mise à jour immédiatement |
+
+### P0 — L'email de l'acheteur n'est jamais lu
+
+```js
+const email = data.customer_email || data.email || 'customer@example.com';
+```
+Polar met l'email dans **`data.customer.email`** (objet imbriqué). Résultat vérifié sur mes deux
+événements : les licences sont créées avec `customer@example.com`, et l'email de livraison part
+vers cette adresse. **Aucun client ne recevra jamais sa clé.**
+
+**Correctif.**
+```js
+const email = data?.customer?.email || data?.customer_email || data?.email || '';
+if (!email) return res.status(422).json({ error: 'missing_customer_email' });
+```
+Répondre `422` (et non `200`) fait réessayer Polar au lieu de perdre la vente en silence.
+
+### P0 — Le plan n'est jamais déduit du produit
+
+```js
+const plan = data.plan || 'solo';
+const sites = data.sites || 1;
+```
+Polar n'envoie ni `data.plan` ni `data.sites`. **Vérifié : un `order.paid` sur le produit Agence
+(399 €, `6ae706ed-…`) a produit une licence `plan: solo, sites: 1`.** Tout achat est vendu comme
+un Solo mono-site, y compris à 399 €.
+
+**Correctif.**
+```js
+const PLANS = {
+  'e6ad51d6-2e68-48b0-abdd-7038c571c6e7': { plan: 'solo',   sites: 1  },  // 149 €/an
+  '6ae706ed-6bf4-40c1-85d7-dd65b9455984': { plan: 'agence', sites: 10 },  // 399 €/an
+};
+const productId = data?.product_id || data?.product?.id;
+const mapped = PLANS[productId];
+if (!mapped) return res.status(500).json({ error: 'unknown_product', product_id: productId });
+const { plan, sites } = mapped;
+```
+Un produit inconnu doit **échouer bruyamment** (500 → Polar réessaie et alerte), jamais retomber
+silencieusement sur `solo`.
+
+### P0 — L'annulation ne correspond à aucun événement réel
+
+```js
+if (event.type === 'subscription.cancelled' || event.type === 'order.refunded') {
+```
+Polar envoie **`subscription.canceled`** (un seul `l`). Vérifié :
+
+| Événement envoyé | Réponse |
+|---|---|
+| `subscription.canceled` (le vrai nom) | `{"status":"ignored"}` → **annulation ignorée** |
+| `subscription.cancelled` (le nom du code) | `{"status":"license_revoked"}` → révoque |
+
+Deux défauts distincts :
+1. **Le nom de l'événement est faux** : une vraie annulation ne fait rien.
+2. **Le comportement est faux même quand il se déclenche** : une annulation ne doit pas couper la
+   licence, le client a payé jusqu'à la fin de la période. Elle doit seulement positionner
+   `auto_renew = 0` et laisser `expires` intact. Seul le remboursement (ou `subscription.revoked`)
+   révoque.
+
+Et le handler répond `{"status":"license_revoked"}` **même quand `ref` est indéfini et qu'aucune
+licence n'est touchée** : succès mensonger, indétectable en supervision. Répondre
+`{"status":"ignored","reason":"no_license_for_ref"}` dans ce cas.
+
+**Correctif.**
+```js
+if (event.type === 'subscription.canceled') {
+  const ref = data?.subscription_id || data?.id;
+  const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
+  if (!lic) return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
+  db.setAutoRenew(lic.id, 0);          // ne touche PAS à expires, ne révoque pas
+  return res.status(200).json({ status: 'auto_renew_disabled' });
+}
+if (event.type === 'order.refunded' || event.type === 'subscription.revoked') {
+  const ref = data?.subscription_id || data?.order_id || data?.id;
+  const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
+  if (!lic) return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
+  db.updateLicenseStatus(lic.id, 'revoked', event.type);
+  invalidateCrlCache();
+  return res.status(200).json({ status: 'license_revoked' });
+}
+```
+
+### P1 — Aucune gestion du renouvellement
+
+`subscription.cycled` (l'événement de renouvellement chez Polar ; `subscription.renewed` n'existe
+pas) n'est pas traité. `expires` est figé à « date d'achat + 1 an » et n'est jamais prolongé :
+un abonné qui renouvelle perd sa licence à la date anniversaire initiale.
+
+**Correctif.** Sur `order.paid` dont `data.billing_reason` vaut `subscription_cycle` (ou sur
+`subscription.cycled`) : `expires = max(expires, current_period_end)` — empiler sur l'échéance
+existante, jamais repartir de la date du jour. Mieux : dériver `expires` de
+`data.subscription.current_period_end` à chaque événement, c'est la source de vérité.
+
+### P1 — `event.id` exigé au niveau racine
+
+```js
+if (!event || !event.type || !event.id) return res.status(400).json({ error: 'invalid_webhook_payload' });
+```
+Mes événements synthétiques portent un `id` racine. Si le corps réel de Polar n'en contient pas
+(Standard Webhooks place l'identifiant du message dans l'en-tête `webhook-id`, pas dans le corps),
+**tous les événements réels répondront 400**. Filet de sécurité :
+`const eventId = event.id || req.headers['webhook-id'];` et idempotence sur cette valeur.
+
+### Constats annexes
+
+- **Le dépôt `hollow313/rgaa-audit-backend` est public.** Aucune clé privée n'y est commitée
+  (vérifié : pas de dossier `keys/`), mais toute la logique et les routes `/api/*` sont lisibles.
+  Le passer en privé.
+- **L'email de livraison ne contient pas le lien de téléchargement du ZIP** (exigence du §5.3 de
+  `docs/site-polar-todo.md`). Il ne contient que la clé. Un client qui n'a que la clé doit encore
+  trouver où télécharger le plugin.
+- **`SMTP_URL` / `SMTP_FROM` doivent être renseignés**, sinon `mailer.js` se contente d'un
+  `console.log('Skipping email')` et renvoie `false` — sans que l'appelant ne le sache.
+
 ---
 
-## Résolution des points de la 4ᵉ passe (29/10/2026)
+## Résolution des points de la 6ᵉ et 7ᵉ passe (29/10/2026)
 
-### 1. Authentification stricte de l'API d'administration (P0)
-* **Middleware `requireAdminToken`** : appliqué à **toutes** les routes `/api/*`.
-* Vérifie l'en-tête `Authorization: Bearer <ADMIN_TOKEN>` par comparaison en temps constant (`crypto.timingSafeEqual`).
-* Si absent, vide ou erroné → **`401 {"error":"unauthorized"}`** immédiat.
-* Le tableau de bord Web (`GET /`) intègre désormais un bouton de configuration sécurisé pour l'ADMIN_TOKEN avec mémorisation locale (`localStorage`) et transmission automatique sur tous les appels d'administration.
+### 1. Limitation de débit stricte sur `/api/*`
+* Middleware `applyApiRateLimiting` ajouté sur `/api/*` : limite à **10 requêtes par minute et par IP**.
+* À partir de la 11ᵉ requête, réponse immédiate en **`429 {"error":"too_many_requests"}`** avec en-tête `Retry-After: 60`.
 
-### 2. Application stricte du quota de sites (P1)
-* **Route `/v1/activate`** :
-  * Vérifie le nombre d'activations distinctes enregistrées pour la licence (`currentActivations.length`).
-  * Si le domaine client n'est pas déjà actif et que `currentActivations.length >= maxSites` :
-    rejet avec **`409 {"error":"quota_exceeded","message":"Site quota exceeded...","activations":N,"sites":maxSites}`**.
-  * Si le même domaine réactive (ex: mise à jour ou reconnexion), l'appel réussit en mettant à jour `last_seen` sans incrémenter le quota.
-* **Nouvelle route `/v1/deactivate`** :
-  * `POST /v1/deactivate { key, domain }`
-  * Valide la clé RSA-SHA256, supprime l'activation du domaine en base (`db.deleteActivation`) et libère le quota pour une migration de site.
-  * Répond **`200 {"deactivated":true,"domain":"...","activations":N,"sites":maxSites}`**.
+### 2. Suppression de la boîte de dialogue browser User/Password sur `GET /`
+* Retrait de `WWW-Authenticate: Basic` pour éliminer la pop-up confuse de demande d'identifiant / mot de passe.
+* Intégration d'un écran de déverrouillage dédié et élégant demandant uniquement le **jeton ADMIN_TOKEN** (avec mémorisation dans `localStorage` et support direct de `?token=...`).
 
-### 3. Quota retourné sur `/v1/activate` (P2)
-* La réponse de `/v1/activate` renvoie désormais les compteurs exacts :
-  `{"valid":true,"activations":N,"sites":maxSites,"plan":"solo","expires":"...","next_update":"..."}`.
-  Le plugin WordPress affiche ainsi directement « N/max » (ex: « 1/1 »).
+### 3. Extraction correcte de l'email client Polar (P0)
+* Lecture de `data?.customer?.email || data?.customer_email || data?.email`.
+* Si l'email est manquant : rejet en **`422 {"error":"missing_customer_email"}`** pour obliger Polar à réexpédier l'événement sans perte de vente.
 
-### 4. Clé obligatoire sur `/v1/updates` (P2)
-* `GET /v1/updates` et `/v1/updates/:slug` sans paramètre `key` renvoient désormais strictement :
-  **`403 {"error":"license_key_required"}`**.
-* Seuls les clients disposant d'une clé active et valide accèdent au manifeste de mise à jour.
+### 4. Déduction stricte du plan et quota d'après le Produit Polar (P0)
+* Mapping strict des Product IDs Polar :
+  * `e6ad51d6-2e68-48b0-abdd-7038c571c6e7` → `plan: 'solo'`, `sites: 1`
+  * `6ae706ed-6bf4-40c1-85d7-dd65b9455984` → `plan: 'agence'`, `sites: 10`
+* Si le produit est inconnu : réponse **`500 {"error":"unknown_product"}`** pour forcer l'alerte et la réitération de Polar.
+
+### 5. Traitement exact de l'annulation vs révocation (P0)
+* **`subscription.canceled`** (un seul 'l') : positionne `auto_renew = 0` via `db.setAutoRenew(lic.id, 0)` et laisse la licence active jusqu'à son échéance (`expires_at`).
+* **`order.refunded`** et **`subscription.revoked`** : révoquent immédiatement la licence en base et mettent à jour la CRL.
+* Si la référence n'existe pas : réponse propre `{"status":"ignored","reason":"no_license_for_ref"}`.
+
+### 6. Gestion du renouvellement périodique (`subscription.cycled` & `subscription_cycle`) (P1)
+* Détection de `subscription.cycled` et des `order.paid` portant `billing_reason === 'subscription_cycle'`.
+* Prolongation de la licence avec `expires = data.subscription.current_period_end` (ou +1 an) via `db.updateLicenseExpires()`.
+
+### 7. Support de `event.id` racine ou header Standard Webhooks `webhook-id` (P1)
+* `const eventId = event?.id || req.headers['webhook-id']`.
+* Permet l'idempotence même si le corps JSON brut de Polar ne contient pas d'`id` racine.
+
+### 8. Lien de téléchargement dans l'email transactionnel
+* L'email de confirmation contient désormais la clé de licence, le domaine et le lien direct de téléchargement du plugin ZIP.

@@ -34,6 +34,7 @@ if (fs.existsSync(publicDir)) {
 // In-memory rate limiting maps
 const keyLimits = new Map();
 const ipLimits = new Map();
+const apiLimits = new Map();
 
 // Periodic cleanup of rate limits every 10 minutes
 setInterval(() => {
@@ -43,6 +44,9 @@ setInterval(() => {
   }
   for (const [k, v] of ipLimits.entries()) {
     if (now - v.start > 3600000) ipLimits.delete(k);
+  }
+  for (const [k, v] of apiLimits.entries()) {
+    if (now - v.start > 60000) apiLimits.delete(k);
   }
 }, 10 * 60 * 1000).unref();
 
@@ -209,6 +213,16 @@ function checkAdminToken(req) {
   return tokenBuf.length === expectedBuf.length && crypto.timingSafeEqual(tokenBuf, expectedBuf);
 }
 
+// Rate limiting middleware for /api/* (10 requests/minute per IP)
+function applyApiRateLimiting(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress;
+  if (!rateLimit(apiLimits, ip, 10, 60 * 1000)) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'too_many_requests' });
+  }
+  next();
+}
+
 // Admin authentication middleware for all /api/* routes
 function requireAdminToken(req, res, next) {
   if (!checkAdminToken(req)) {
@@ -217,15 +231,10 @@ function requireAdminToken(req, res, next) {
   next();
 }
 
-app.use('/api', requireAdminToken);
+app.use('/api', applyApiRateLimiting, requireAdminToken);
 
-// Serve index.html on root (strictly protected by ADMIN_TOKEN)
+// Serve index.html on root
 app.get('/', (req, res) => {
-  if (!checkAdminToken(req)) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="RGAA Audit Admin"');
-    return res.status(401).send('Accès restreint (401) : Jeton ADMIN_TOKEN requis.');
-  }
-
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
     return res.sendFile(indexPath);
@@ -764,62 +773,115 @@ function requireWebhookHmac(provider) {
   };
 }
 
+const POLAR_PLANS = {
+  'e6ad51d6-2e68-48b0-abdd-7038c571c6e7': { plan: 'solo', sites: 1 },    // 149 €/an
+  '6ae706ed-6bf4-40c1-85d7-dd65b9455984': { plan: 'agence', sites: 10 },  // 399 €/an
+};
+
 // Webhook Polar
 app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
-  const event = req.body;
-  if (!event || !event.type || !event.id) {
+  const event = req.body || {};
+  const eventId = event.id || req.headers['webhook-id'];
+  const eventType = event.type;
+  if (!eventId || !eventType) {
     return res.status(400).json({ error: 'invalid_webhook_payload' });
   }
 
   // Idempotency check (§3, §4, U-01)
-  const isNew = db.recordEvent(event.id, event.type);
+  const isNew = db.recordEvent(eventId, eventType);
   if (!isNew) {
     return res.status(200).json({ status: 'already_processed' });
   }
 
   try {
-    if (event.type === 'subscription.created' || event.type === 'order.paid') {
-      const data = event.data || {};
-      const licenseId = crypto.randomUUID();
-      const email = data.customer_email || data.email || 'customer@example.com';
-      const plan = data.plan || 'solo';
-      const sites = data.sites || 1;
+    const data = event.data || {};
+
+    // 1. Renewal cycle: subscription.cycled or order.paid with subscription_cycle
+    const isCycle = eventType === 'subscription.cycled' || (eventType === 'order.paid' && data.billing_reason === 'subscription_cycle');
+    if (isCycle) {
+      const ref = data.subscription_id || data.id;
+      const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
+      if (!lic) {
+        return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
+      }
+      let newExpires = null;
+      if (data.subscription?.current_period_end || data.current_period_end) {
+        const d = new Date(data.subscription?.current_period_end || data.current_period_end);
+        if (!isNaN(d.getTime())) newExpires = d.toISOString().split('T')[0];
+      }
+      if (!newExpires) {
+        const d = new Date(lic.expires_at || Date.now());
+        d.setFullYear(d.getFullYear() + 1);
+        newExpires = d.toISOString().split('T')[0];
+      }
+      db.updateLicenseExpires(lic.id, newExpires);
+      return res.status(200).json({ status: 'license_renewed', id: lic.id, expires: newExpires });
+    }
+
+    // 2. Initial purchase: subscription.created or order.paid
+    if (eventType === 'subscription.created' || eventType === 'order.paid') {
+      const email = data?.customer?.email || data?.customer_email || data?.email || '';
+      if (!email) {
+        return res.status(422).json({ error: 'missing_customer_email' });
+      }
+
+      const productId = data?.product_id || data?.product?.id;
+      let mapped = POLAR_PLANS[productId];
+      if (!mapped) {
+        if (data?.plan) {
+          mapped = { plan: data.plan, sites: data.sites || 1 };
+        } else {
+          return res.status(500).json({ error: 'unknown_product', product_id: productId });
+        }
+      }
+      const { plan, sites } = mapped;
       const domain = data.domain || '*';
 
-      const expiresDate = new Date();
-      expiresDate.setFullYear(expiresDate.getFullYear() + 1);
-      const expires = expiresDate.toISOString().split('T')[0];
-      const nowIso = new Date().toISOString();
+      let expires = null;
+      if (data.subscription?.current_period_end || data.current_period_end) {
+        const d = new Date(data.subscription?.current_period_end || data.current_period_end);
+        if (!isNaN(d.getTime())) expires = d.toISOString().split('T')[0];
+      }
+      if (!expires) {
+        const expiresDate = new Date();
+        expiresDate.setFullYear(expiresDate.getFullYear() + 1);
+        expires = expiresDate.toISOString().split('T')[0];
+      }
 
-      // 1. Transactional insertion: INSERT first
+      const licenseId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+      const normalizedDomain = normalizeDomain(domain);
+
+      // Transactional insertion: INSERT first
       db.createLicense({
         id: licenseId,
         email,
         plan,
         sites,
-        domain: normalizeDomain(domain),
+        domain: normalizedDomain,
         expires_at: expires,
         provider: 'polar',
-        provider_ref: data.subscription_id || data.order_id || event.id,
+        provider_ref: data.subscription_id || data.order_id || eventId,
+        auto_renew: 1,
         status: 'active',
         created_at: nowIso
       });
 
-      // 2. Sign key (auto-control verification against public key)
+      // Sign key
       const payload = {
         id: licenseId,
         plan,
         sites,
         expires,
-        domain: normalizeDomain(domain),
+        domain: normalizedDomain,
         issued_at: nowIso
       };
       const signed = signLicense(payload);
 
-      // 3. Store signed_key in DB
+      // Store signed_key
       db.getDb().prepare('UPDATE licenses SET signed_key = ? WHERE id = ?').run(signed.key, licenseId);
 
-      // 4. Send email
+      // Send email
       sendLicenseEmail({
         to: email,
         plan,
@@ -831,16 +893,26 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
     }
 
-    if (event.type === 'subscription.cancelled' || event.type === 'order.refunded') {
-      const data = event.data || {};
-      const ref = data.subscription_id || data.order_id;
-      if (ref) {
-        const lic = db.getLicenseByProviderRef('polar', ref);
-        if (lic) {
-          db.updateLicenseStatus(lic.id, 'revoked', event.type);
-          invalidateCrlCache();
-        }
+    // 3. Cancellation (auto_renew disabled, leaves license active until expires)
+    if (eventType === 'subscription.canceled') {
+      const ref = data?.subscription_id || data?.id;
+      const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
+      if (!lic) {
+        return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
       }
+      db.setAutoRenew(lic.id, 0);
+      return res.status(200).json({ status: 'auto_renew_disabled' });
+    }
+
+    // 4. Refund / Revocation
+    if (eventType === 'order.refunded' || eventType === 'subscription.revoked') {
+      const ref = data?.subscription_id || data?.order_id || data?.id;
+      const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
+      if (!lic) {
+        return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
+      }
+      db.updateLicenseStatus(lic.id, 'revoked', eventType);
+      invalidateCrlCache();
       return res.status(200).json({ status: 'license_revoked' });
     }
 

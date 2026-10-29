@@ -475,6 +475,27 @@
     </div>
   </div>
 
+  <!-- Modal Authentification ADMIN_TOKEN -->
+  <div class="modal-overlay" id="admin-login-modal" style="display: none; z-index: 9999;">
+    <div class="modal" style="max-width: 440px;">
+      <div style="text-align: center; margin-bottom: 1.25rem;">
+        <div style="font-size: 2.2rem; margin-bottom: 0.3rem;">🛡️</div>
+        <h3 style="font-size: 1.25rem; margin-bottom: 0.3rem;">Authentification Administrateur</h3>
+        <p style="font-size: 0.8125rem; color: var(--text-muted); margin: 0;">
+          Saisissez votre jeton <code>ADMIN_TOKEN</code> pour gérer les licences.
+        </p>
+      </div>
+      <form onsubmit="handleAdminLogin(event)">
+        <div style="margin-bottom: 1rem;">
+          <label for="login-token-input" style="font-size: 0.8125rem; font-weight: 600; display: block; margin-bottom: 0.4rem;">Jeton secret (ADMIN_TOKEN) :</label>
+          <input type="password" id="login-token-input" placeholder="ex: monSecretAdmin123!" style="width: 100%; box-sizing: border-box;" required autofocus>
+          <div id="login-error-msg" style="color: var(--danger); font-size: 0.8125rem; margin-top: 0.4rem; display: none;"></div>
+        </div>
+        <button type="submit" class="btn-primary" id="login-submit-btn" style="width: 100%; padding: 0.75rem; justify-content: center;">🔓 Déverrouiller le Tableau de bord</button>
+      </form>
+    </div>
+  </div>
+
   <!-- Toast -->
   <div class="toast" id="toast">✅ Clé copiée dans le presse-papier !</div>
 
@@ -502,24 +523,68 @@
       }
     } catch (e) {}
 
-    function promptChangeAdminToken() {
-      const current = getAdminToken();
-      const nextToken = prompt('Jeton administrateur pour l\'API (ADMIN_TOKEN) :', current);
-      if (nextToken !== null) {
-        setAdminToken(nextToken);
-        loadData();
+    function showLoginModal(errorText = '') {
+      const modal = document.getElementById('admin-login-modal');
+      const err = document.getElementById('login-error-msg');
+      if (errorText) {
+        err.textContent = errorText;
+        err.style.display = 'block';
+      } else {
+        err.style.display = 'none';
+      }
+      modal.style.display = 'flex';
+      setTimeout(() => {
+        const inp = document.getElementById('login-token-input');
+        if (inp) inp.focus();
+      }, 100);
+    }
+
+    function hideLoginModal() {
+      document.getElementById('admin-login-modal').style.display = 'none';
+    }
+
+    async function handleAdminLogin(e) {
+      e.preventDefault();
+      const input = document.getElementById('login-token-input');
+      const token = input.value.trim();
+      const btn = document.getElementById('login-submit-btn');
+
+      if (!token) return;
+      btn.disabled = true;
+      btn.textContent = 'Vérification en cours...';
+
+      try {
+        const res = await fetch('/api/stats', {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+
+        if (res.ok) {
+          setAdminToken(token);
+          hideLoginModal();
+          showToast('✅ Authentification réussie !');
+          loadData();
+        } else {
+          showLoginModal('Jeton ADMIN_TOKEN invalide ou non autorisé (401).');
+        }
+      } catch (err) {
+        showLoginModal('Erreur de connexion : ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🔓 Déverrouiller le Tableau de bord';
       }
     }
 
+    function promptChangeAdminToken() {
+      setAdminToken('');
+      document.getElementById('login-token-input').value = '';
+      showLoginModal();
+    }
+
     async function fetchWithAuth(url, options = {}) {
-      let token = getAdminToken();
+      const token = getAdminToken();
       if (!token) {
-        token = prompt('Accès sécurisé : veuillez saisir votre jeton ADMIN_TOKEN :');
-        if (token) {
-          setAdminToken(token);
-        } else {
-          throw new Error('ADMIN_TOKEN requis');
-        }
+        showLoginModal();
+        throw new Error('ADMIN_TOKEN requis');
       }
 
       options.headers = options.headers || {};
@@ -528,11 +593,7 @@
       const res = await fetch(url, options);
       if (res.status === 401) {
         setAdminToken('');
-        const retryToken = prompt('Accès refusé (401 non autorisé). Veuillez saisir le jeton ADMIN_TOKEN valide :');
-        if (retryToken) {
-          setAdminToken(retryToken);
-          return fetchWithAuth(url, options);
-        }
+        showLoginModal('Session expirée ou jeton ADMIN_TOKEN invalide (401).');
         throw new Error('Accès non autorisé (401)');
       }
       return res;
@@ -544,6 +605,12 @@
     document.getElementById('expires').value = nextYear.toISOString().split('T')[0];
 
     async function loadData() {
+      const token = getAdminToken();
+      if (!token) {
+        showLoginModal();
+        return;
+      }
+
       try {
         const [licRes, statsRes, sharedRes] = await Promise.all([
           fetchWithAuth('/api/licenses'),

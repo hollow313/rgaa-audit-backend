@@ -52,6 +52,7 @@ function initSchema(db) {
       status        TEXT NOT NULL DEFAULT 'active',-- active | revoked | refunded
       provider      TEXT NOT NULL,                 -- polar | paddle | manual
       provider_ref  TEXT,                          -- id d'abonnement / de commande
+      auto_renew    INTEGER NOT NULL DEFAULT 1,    -- renouvellement automatique actif
       created_at    TEXT NOT NULL,
       revoked_at    TEXT,
       revoke_reason TEXT,
@@ -87,12 +88,13 @@ function initSchema(db) {
     );
   `);
 
-  // Migration for signed_key column in case table already existed
+  // Migration for signed_key and auto_renew columns in case table already existed
   try {
     db.exec('ALTER TABLE licenses ADD COLUMN signed_key TEXT;');
-  } catch {
-    // Column already exists
-  }
+  } catch {}
+  try {
+    db.exec('ALTER TABLE licenses ADD COLUMN auto_renew INTEGER NOT NULL DEFAULT 1;');
+  } catch {}
 
   // Revoke security-test licenses if present (§P0)
   try {
@@ -111,8 +113,8 @@ function createLicense(data, customDb = null) {
   const db = customDb || getDb();
   const stmt = db.prepare(`
     INSERT INTO licenses (
-      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, created_at, signed_key
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, email, plan, sites, domain, expires_at, status, provider, provider_ref, auto_renew, created_at, signed_key
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     data.id,
@@ -124,10 +126,25 @@ function createLicense(data, customDb = null) {
     data.status || 'active',
     data.provider || 'manual',
     data.provider_ref || null,
+    data.auto_renew !== undefined ? (data.auto_renew ? 1 : 0) : 1,
     data.created_at || new Date().toISOString(),
     data.signed_key || null
   );
   return getLicenseById(data.id, db);
+}
+
+function setAutoRenew(id, autoRenew = 0, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('UPDATE licenses SET auto_renew = ? WHERE id = ?');
+  stmt.run(autoRenew ? 1 : 0, id);
+  return getLicenseById(id, db);
+}
+
+function updateLicenseExpires(id, newExpires, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare('UPDATE licenses SET expires_at = ? WHERE id = ?');
+  stmt.run(newExpires, id);
+  return getLicenseById(id, db);
 }
 
 function getLicenseById(id, customDb = null) {
@@ -324,6 +341,8 @@ module.exports = {
   getLicenseById,
   getLicenseByProviderRef,
   updateLicenseStatus,
+  setAutoRenew,
+  updateLicenseExpires,
   listLicenses,
   getLicenseStats,
   recordActivation,

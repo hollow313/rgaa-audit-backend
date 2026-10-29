@@ -25,7 +25,7 @@ L'accès au tableau de bord s'effectue via votre navigateur :
 ```
 http://<IP-du-serveur>:30019/?token=<ADMIN_TOKEN>
 ```
-ou directement `http://<IP-du-serveur>:30019/` (le navigateur ouvrira alors une boîte d'authentification HTTP Basic sécurisée pour renseigner votre `ADMIN_TOKEN`).
+ou directement `http://<IP-du-serveur>:30019/` (une boîte de dialogue modale s'affiche pour renseigner votre `ADMIN_TOKEN`). Aucun identifiant ni mot de passe n'est demandé : seul le jeton secret est requis.
 
 Le jeton est ensuite mémorisé localement dans votre navigateur (`localStorage`), et vous pouvez à tout moment le modifier ou vous déconnecter via le bouton **`🔒 Token Admin`** situé dans l'en-tête.
 

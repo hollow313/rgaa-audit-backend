@@ -13,13 +13,14 @@ function getTransporter() {
   return transporter;
 }
 
-async function sendLicenseEmail({ to, plan, domain, expires, key }) {
+async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = null }) {
   const mailer = getTransporter();
   if (!mailer) {
     console.log(`[mailer] SMTP_URL not configured. Skipping email to ${to.replace(/(?<=.{2}).(?=.*@)/g, '*')}`);
     return false;
   }
 
+  const dlLink = downloadUrl || `https://updates.rgaa-audit.eu/v1/updates/rgaa-audit?key=${encodeURIComponent(key)}`;
   const subject = 'Votre clé de licence RGAA Audit';
   const text = `Bonjour,
 
@@ -32,6 +33,9 @@ Détails de la licence :
 - Plan : ${plan}
 - Domaine associé : ${domain}
 - Date d'expiration : ${expires}
+
+Téléchargement de l'extension :
+${dlLink}
 
 Pour l'activer, rendez-vous dans l'administration WordPress de votre site :
 RGAA Audit > Réglages > Clé de licence.
