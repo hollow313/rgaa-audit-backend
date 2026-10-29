@@ -15,8 +15,9 @@ const {
 const { sendLicenseEmail } = require('./mailer');
 
 const app = express();
+app.disable('x-powered-by');
 
-// Parse json with raw body capture for webhooks
+// Parse JSON with raw body retention for HMAC verification
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -44,6 +45,15 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
+// Periodic purge of events older than 90 days (U-04 RGPD)
+setInterval(() => {
+  try {
+    db.purgeOldEvents(90);
+  } catch (err) {
+    console.error('[cron] Failed to purge old events:', err.message);
+  }
+}, 24 * 3600 * 1000).unref();
+
 function rateLimit(map, key, maxRequests, windowMs) {
   const now = Date.now();
   let record = map.get(key);
@@ -55,11 +65,32 @@ function rateLimit(map, key, maxRequests, windowMs) {
   return record.count <= maxRequests;
 }
 
-// Structured JSON logger (no emails, no license keys in stdout)
+// Rate limiting middleware for /v1/updates*, /v1/download*, /v1/activate* (U-05)
+function applyRateLimiting(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress;
+
+  // 60 requests/hour per IP
+  if (!rateLimit(ipLimits, ip, 60, 60 * 60 * 1000)) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'too_many_requests' });
+  }
+
+  // 10 requests/minute per key
+  const key = req.query.key || (req.body && req.body.key);
+  if (key) {
+    if (!rateLimit(keyLimits, key, 10, 60 * 1000)) {
+      res.setHeader('Retry-After', '60');
+      return res.status(429).json({ error: 'too_many_requests' });
+    }
+  }
+
+  next();
+}
+
+// Structured JSON logger (no emails, no license keys in stdout) (§8 & U-04)
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    // Only log API requests, skip static asset spam
     if (req.path.startsWith('/v1/') || req.path.startsWith('/api/') || req.path === '/healthz') {
       const duration = Date.now() - start;
       const logEntry = {
@@ -90,10 +121,70 @@ function requireAdmin(req, res, next) {
 }
 
 /* ----------------------------------------------------
+   CRL Cache & ETag State (B-02)
+---------------------------------------------------- */
+let cachedCrl = null;
+let cachedCrlTime = 0;
+let cachedRevokedFingerprint = '';
+
+function getCachedCrl() {
+  const now = Date.now();
+  const revoked = db.getRevokedLicenses();
+
+  // Sort deterministically by license_id
+  revoked.sort((a, b) => (a.license_id || '').localeCompare(b.license_id || ''));
+
+  // Fingerprint of the revocation list
+  const currentFingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify(revoked))
+    .digest('hex');
+
+  const isExpired = (now - cachedCrlTime) >= config.crlValidityHours * 3600 * 1000;
+  const isChanged = currentFingerprint !== cachedRevokedFingerprint;
+
+  if (!cachedCrl || isChanged || isExpired) {
+    const issuedAt = new Date(now);
+    const nextUpdate = new Date(now + config.crlValidityHours * 3600 * 1000);
+
+    const crlLogical = {
+      version: 1,
+      issued_at: issuedAt.toISOString(),
+      next_update: nextUpdate.toISOString(),
+      revoked: revoked.map(r => ({
+        license_id: r.license_id,
+        revoked_at: r.revoked_at,
+        reason: r.reason || 'revoked'
+      }))
+    };
+
+    const signed = signEnvelope(crlLogical);
+
+    // Stable ETag derived from logical state (revoked fingerprint + next_update)
+    const etagData = `${currentFingerprint}:${crlLogical.next_update}`;
+    const etag = `W/"${crypto.createHash('sha256').update(etagData).digest('hex').substring(0, 16)}"`;
+
+    cachedCrl = {
+      signed,
+      etag
+    };
+    cachedCrlTime = now;
+    cachedRevokedFingerprint = currentFingerprint;
+  }
+
+  return cachedCrl;
+}
+
+function invalidateCrlCache() {
+  cachedCrl = null;
+  cachedCrlTime = 0;
+  cachedRevokedFingerprint = '';
+}
+
+/* ----------------------------------------------------
    Web UI Dashboard API
 ---------------------------------------------------- */
 
-// Serve index.html explicitly on root
+// Serve index.html on root
 app.get('/', (req, res) => {
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
@@ -112,7 +203,7 @@ app.get('/api/stats', (req, res) => {
   }
 });
 
-// List licenses with signed keys for the dashboard
+// List licenses with signed keys and activations for dashboard
 app.get('/api/licenses', (req, res) => {
   try {
     const rawLicenses = db.listLicenses();
@@ -198,6 +289,7 @@ app.post('/api/licenses/:id/revoke', (req, res) => {
     if (!updated) {
       return res.status(404).json({ error: 'Licence introuvable' });
     }
+    invalidateCrlCache();
     res.json({ ok: true, license: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -215,7 +307,7 @@ app.get('/api/shared', (req, res) => {
 });
 
 /* ----------------------------------------------------
-   Endpoints
+   Core Endpoints
 ---------------------------------------------------- */
 
 // Healthcheck (§8 Ops)
@@ -238,21 +330,11 @@ app.get('/v1/public-key', (req, res) => {
   }
 });
 
-// Activation (§4)
-app.post('/v1/activate', (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress;
-  if (!rateLimit(ipLimits, ip, 60, 60 * 60 * 1000)) {
-    return res.status(429).json({ error: 'rate_limited', message: 'Too many requests from this IP' });
-  }
-
+// Activation (with U-05 rate limiting)
+app.post('/v1/activate', applyRateLimiting, (req, res) => {
   const { key, domain, plugin_version } = req.body || {};
   if (!key || !domain) {
     return res.status(400).json({ error: 'bad_request', message: 'Missing key or domain' });
-  }
-
-  // Rate limit by key (10 req/min)
-  if (!rateLimit(keyLimits, key, 10, 60 * 1000)) {
-    return res.status(429).json({ error: 'rate_limited', message: 'Too many requests for this license key' });
   }
 
   // Verify signature
@@ -293,7 +375,7 @@ app.post('/v1/activate', (req, res) => {
         return res.status(403).json({ error: 'license_revoked', message: 'License has been revoked' });
       }
     }
-    // Record activation
+    // Record activation (without storing IP or User-Agent, U-04)
     db.recordActivation({
       license_id: licenseId,
       domain: clientDomainNorm,
@@ -311,39 +393,28 @@ app.post('/v1/activate', (req, res) => {
   });
 });
 
-// CRL (Certificate Revocation List) (§1.2 & §4)
+// CRL (Certificate Revocation List) — B-02 stable cache & 304 handling
 app.get('/v1/crl', (req, res) => {
-  const revoked = db.getRevokedLicenses();
-  const now = new Date();
-  const nextUpdate = new Date(now.getTime() + config.crlValidityHours * 3600 * 1000);
-
-  const crl = {
-    version: 1,
-    issued_at: now.toISOString(),
-    next_update: nextUpdate.toISOString(),
-    revoked: revoked.map(r => ({
-      license_id: r.license_id,
-      revoked_at: r.revoked_at,
-      reason: r.reason || 'revoked'
-    }))
-  };
-
-  const signed = signEnvelope(crl);
-
-  const rawJson = JSON.stringify(signed);
-  const etag = `W/"${crypto.createHash('sha256').update(rawJson).digest('hex').substring(0, 16)}"`;
-
-  if (req.headers['if-none-match'] === etag) {
-    return res.status(304).end();
-  }
+  const crl = getCachedCrl();
 
   res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.setHeader('ETag', etag);
-  res.json(signed);
+  res.setHeader('ETag', crl.etag);
+
+  // If-None-Match header check (support weak and strong tags)
+  const clientEtag = req.headers['if-none-match'];
+  if (clientEtag) {
+    const normalizedClient = clientEtag.trim().replace(/^W\//, '');
+    const normalizedServer = crl.etag.trim().replace(/^W\//, '');
+    if (normalizedClient === normalizedServer) {
+      return res.status(304).end();
+    }
+  }
+
+  res.json(crl.signed);
 });
 
-// Plugin updates manifest (§1.3 & §4)
-app.get(['/v1/updates', '/v1/updates/:slug'], (req, res) => {
+// Plugin updates manifest (B-01: aliases /v1/updates and /v1/updates/:slug, with U-05 rate limiting)
+app.get(['/v1/updates', '/v1/updates/:slug'], applyRateLimiting, (req, res) => {
   const slug = req.params.slug || 'rgaa-audit';
   const key = req.query.key;
 
@@ -362,7 +433,10 @@ app.get(['/v1/updates', '/v1/updates/:slug'], (req, res) => {
 
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
   const host = req.get('host');
-  const baseUrl = `${protocol}://${host}`;
+  let downloadUrl = release.download_url || `${protocol}://${host}/v1/download/${release.version}.zip`;
+  if (key) {
+    downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + `key=${encodeURIComponent(key)}`;
+  }
 
   const manifest = {
     slug,
@@ -370,7 +444,7 @@ app.get(['/v1/updates', '/v1/updates/:slug'], (req, res) => {
     requires: release.requires || '6.5',
     tested: release.tested || '6.8',
     requires_php: release.requires_php || '8.1',
-    download_url: release.download_url || `${baseUrl}/v1/download/${release.version}.zip`,
+    download_url: downloadUrl,
     sha256: release.sha256,
     published_at: release.published_at,
     changelog: release.changelog || ''
@@ -380,8 +454,8 @@ app.get(['/v1/updates', '/v1/updates/:slug'], (req, res) => {
   res.json(signed);
 });
 
-// Plugin zip download (§4)
-app.get('/v1/download/:version.zip', (req, res) => {
+// Plugin ZIP download (with U-05 rate limiting)
+app.get('/v1/download/:version.zip', applyRateLimiting, (req, res) => {
   const { version } = req.params;
   const key = req.query.key;
 
@@ -404,14 +478,80 @@ app.get('/v1/download/:version.zip', (req, res) => {
   res.sendFile(path.resolve(release.zip_path));
 });
 
-// Webhook Polar (§4)
+/* ----------------------------------------------------
+   Webhooks Polar & Paddle (U-01)
+---------------------------------------------------- */
+
+function verifyPolarHmac(req, secret) {
+  if (!secret) return true; // dev/test mode
+  const header = req.headers['polar-webhook-signature'] || req.headers['webhook-signature'];
+  if (!header) return false;
+
+  const parts = header.split(',');
+  const tPart = parts.find(p => p.startsWith('t='));
+  const v1Part = parts.find(p => p.startsWith('v1='));
+  if (!tPart || !v1Part) return false;
+
+  const timestamp = parseInt(tPart.slice(2), 10);
+  const sig = v1Part.slice(3);
+
+  // Reject if older than 5 minutes (300 seconds)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > 300) return false;
+
+  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${timestamp}.${raw}`)
+    .digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function verifyPaddleHmac(req, secret) {
+  if (!secret) return true;
+  const header = req.headers['paddle-signature'];
+  if (!header) return false;
+
+  const parts = header.split(';');
+  const tsPart = parts.find(p => p.startsWith('ts='));
+  const h1Part = parts.find(p => p.startsWith('h1='));
+  if (!tsPart || !h1Part) return false;
+
+  const timestamp = parseInt(tsPart.slice(3), 10);
+  const hash = h1Part.slice(3);
+
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > 300) return false;
+
+  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${timestamp}:${raw}`)
+    .digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expected, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+// Webhook Polar
 app.post('/v1/webhook/polar', async (req, res) => {
+  // HMAC check
+  if (!verifyPolarHmac(req, config.polarWebhookSecret)) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired webhook signature' });
+  }
+
   const event = req.body;
   if (!event || !event.type || !event.id) {
     return res.status(400).json({ error: 'invalid_webhook_payload' });
   }
 
-  // Idempotency check (§3, §4, §6)
+  // Idempotency check (§3, §4, U-01)
   const isNew = db.recordEvent(event.id, event.type);
   if (!isNew) {
     return res.status(200).json({ status: 'already_processed' });
@@ -432,7 +572,6 @@ app.post('/v1/webhook/polar', async (req, res) => {
 
       const payload = {
         id: licenseId,
-        license_id: licenseId,
         plan,
         sites,
         expires,
@@ -455,7 +594,6 @@ app.post('/v1/webhook/polar', async (req, res) => {
         signed_key: signed.key
       });
 
-      // Async email sending
       sendLicenseEmail({
         to: email,
         plan,
@@ -474,6 +612,7 @@ app.post('/v1/webhook/polar', async (req, res) => {
         const lic = db.getLicenseByProviderRef('polar', ref);
         if (lic) {
           db.updateLicenseStatus(lic.id, 'revoked', event.type);
+          invalidateCrlCache();
         }
       }
       return res.status(200).json({ status: 'license_revoked' });
@@ -486,8 +625,12 @@ app.post('/v1/webhook/polar', async (req, res) => {
   }
 });
 
-// Webhook Paddle (§4)
+// Webhook Paddle
 app.post('/v1/webhook/paddle', async (req, res) => {
+  if (!verifyPaddleHmac(req, config.paddleWebhookSecret)) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired webhook signature' });
+  }
+
   const event = req.body;
   const eventId = event?.event_id || event?.id;
   const eventType = event?.event_type || event?.type;
@@ -516,7 +659,6 @@ app.post('/v1/webhook/paddle', async (req, res) => {
 
       const payload = {
         id: licenseId,
-        license_id: licenseId,
         plan,
         sites,
         expires,
@@ -557,6 +699,7 @@ app.post('/v1/webhook/paddle', async (req, res) => {
         const lic = db.getLicenseByProviderRef('paddle', ref);
         if (lic) {
           db.updateLicenseStatus(lic.id, 'revoked', eventType);
+          invalidateCrlCache();
         }
       }
       return res.status(200).json({ status: 'license_revoked' });
@@ -586,7 +729,6 @@ app.post('/v1/admin/issue', requireAdmin, (req, res) => {
 
   const payload = {
     id: licenseId,
-    license_id: licenseId,
     plan: plan || 'solo',
     sites: sites ? parseInt(sites, 10) : 1,
     expires: expires,
@@ -627,6 +769,7 @@ app.post('/v1/admin/revoke', requireAdmin, (req, res) => {
     return res.status(404).json({ error: 'License not found' });
   }
 
+  invalidateCrlCache();
   res.json({ ok: true, license: updated });
 });
 
@@ -669,10 +812,27 @@ app.post('/v1/admin/publish', requireAdmin, (req, res) => {
   res.json({ ok: true, release });
 });
 
+/* ----------------------------------------------------
+   404 & 500 JSON Handlers (B-01)
+---------------------------------------------------- */
+
+// 404 handler: always return JSON, never Express HTML (B-01)
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found' });
+});
+
+// 500 error handler: always return JSON without leaking traces (B-01)
+app.use((err, req, res, next) => {
+  res.status(500).json({ error: 'internal' });
+});
+
 // Start server if run directly
 if (require.main === module) {
   initKeypair();
-  db.getDb(); // initialize database
+  db.getDb();
+  try {
+    db.purgeOldEvents(90);
+  } catch {}
 
   app.listen(config.port, config.host, () => {
     console.log(`[server] RGAA Audit License Server running on http://${config.host}:${config.port}`);
@@ -682,3 +842,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.invalidateCrlCache = invalidateCrlCache;

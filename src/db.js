@@ -279,6 +279,13 @@ function getLatestRelease(customDb = null) {
   return stmt.get();
 }
 
+function purgeOldEvents(days = 90, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare(`DELETE FROM events WHERE datetime(received_at) < datetime('now', '-' || ? || ' days')`);
+  const info = stmt.run(days);
+  return typeof info?.changes === 'number' ? info.changes : 0;
+}
+
 module.exports = {
   getDb,
   initSchema,
@@ -292,6 +299,7 @@ module.exports = {
   getActivations,
   getSharedLicenses,
   recordEvent,
+  purgeOldEvents,
   getRevokedLicenses,
   createRelease,
   getRelease,
