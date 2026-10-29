@@ -78,7 +78,7 @@ docker run -d \
   -p 30019:30019 \
   -v $(pwd)/keys:/keys \
   --restart unless-stopped \
-  ghcr.io/hollow313/rgaa-audit-backend:latest
+  holloow313/rgaa-audit-backend:latest
 ```
 
 ---

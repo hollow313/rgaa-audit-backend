@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/hollow313/rgaa-audit-backend:latest
+    image: holloow313/rgaa-audit-backend:latest
     container_name: rgaa-license-server
     restart: unless-stopped
     user: "568:568"
