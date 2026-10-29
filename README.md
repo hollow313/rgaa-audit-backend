@@ -111,28 +111,44 @@ docker run -d \
 
 ---
 
-## Déploiement sur Serveur & Résolution du statut « Déploiement »
+## Déploiement sur Serveur & Résolution du statut « Déploiement » (TrueNAS SCALE / Docker)
 
-Les orchestrateurs de conteneurs sur serveur (Docker Compose, Kubernetes, Portainer, etc.) surveillent la disponibilité applicative via la sonde `HEALTHCHECK` qui interroge périodiquement `http://127.0.0.1:30019/healthz`.
+Les orchestrateurs de conteneurs sur serveur (TrueNAS SCALE, Docker Compose, Kubernetes, Portainer, etc.) surveillent la disponibilité applicative via la sonde `HEALTHCHECK` qui interroge périodiquement `http://127.0.0.1:30019/healthz`.
 
-### Pourquoi le conteneur reste-t-il en statut « Déploiement » ?
-Par défaut, `PAYMENT_PROVIDERS` est configuré sur `polar`. Si la variable `POLAR_WEBHOOK_SECRET` n'a pas encore été renseignée dans la configuration de votre conteneur, l'endpoint `/healthz` renvoie volontairement un code **`503`**. Cela évite qu'un serveur de production encaisse des paiements sans pouvoir traiter les webhooks.
+### Pourquoi le conteneur reste-t-il en statut jaune « Déploiement » ?
 
-Tant que `/healthz` renvoie 503, Docker considère le conteneur comme `unhealthy`, et le serveur d'applications l'affiche en statut **« Déploiement »** en attendant qu'il devienne sain.
+TrueNAS SCALE affiche le badge jaune **« Déploiement »** avec des métriques à `N/A` tant que le conteneur n'a pas été déclaré **sain (Healthy)** ou que la sonde de disponibilité échoue. Voici les 3 causes fréquentes :
 
-### Comment passer immédiatement au statut « En cours d'exécution » (Actif / Vert) :
-* **Cas 1 : Vous n'avez pas encore branché Polar (émission manuelle ou tests)** :
-  Ajoutez la variable d'environnement suivante dans les réglages de votre application :
+#### 1. Le Healthcheck renvoie `503` (Cause la plus fréquente : Webhook Polar non configuré)
+Par défaut, `PAYMENT_PROVIDERS` est configuré sur `polar`. Si la variable `POLAR_WEBHOOK_SECRET` n'a pas encore été renseignée dans la configuration de votre conteneur, l'endpoint `/healthz` renvoie volontairement un code **`503`** (`{"ok":false,"error":"webhook_secret_missing"}`). Cela évite qu'un serveur de production encaisse des paiements sans pouvoir traiter les webhooks.
+Tant que `/healthz` renvoie 503, Docker considère le conteneur comme `unhealthy`, et TrueNAS l'affiche indéfiniment en statut **« Déploiement »**.
+
+**Comment passer immédiatement au statut « En cours d'exécution » (Actif / Vert) :**
+* **Cas 1 : Vous n'avez pas encore configuré Polar (mode test ou émission manuelle)** :
+  Ajoutez simplement la variable d'environnement suivante dans les paramètres de l'application sur TrueNAS :
   ```env
   PAYMENT_PROVIDERS=none
   ```
   Le healthcheck renverra immédiatement `200 {"ok":true,"db":true}` et le conteneur passera instantanément en vert !
 * **Cas 2 : Vous utilisez Polar pour les paiements en ligne** :
-  Renseignez simplement votre secret de webhook Polar dans les variables d'environnement :
+  Renseignez simplement votre secret de webhook Polar dans les variables d'environnement de l'application :
   ```env
   POLAR_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
   ```
-  Dès que le secret est détecté, `/healthz` répond `200` et le conteneur passe en actif.
+  Dès que le secret est détecté, `/healthz` répond `200` et TrueNAS bascule sur « En cours d'exécution ».
+
+#### 2. Sonde de santé TrueNAS (Readiness Probe) configurée sur `/` au lieu de `/healthz`
+Si vous avez activé une sonde de santé (Readiness Probe / Liveness Probe) dans l'interface TrueNAS :
+* Ne configurez **jamais** le chemin de sonde sur `/` (la racine), car `GET /` renvoie désormais un code **`401 Unauthorized`** pour protéger le tableau de bord d'administration. TrueNAS attend un code `200` et considérera le conteneur comme en échec.
+* Configurez le chemin de sonde sur : **`/healthz`** (Port : **`30019`**), ou désactivez simplement les sondes personnalisées de TrueNAS (le conteneur dispose déjà de son propre `HEALTHCHECK` Docker intégré).
+
+#### 3. Permissions du Dataset de stockage `/keys` (UID 568)
+Le conteneur tourne sous l'utilisateur de sécurité non-root `appuser` avec le **UID/GID `568:568`** (qui correspond d'ailleurs à l'utilisateur système `apps` sur TrueNAS SCALE).
+* Assurez-vous que le Dataset monté dans `/keys` autorise la lecture/écriture pour l'utilisateur `568` (`apps`), ou appliquez les permissions :
+  ```bash
+  chown -R 568:568 /mnt/<pool>/<dataset-keys>
+  chmod -R 770 /mnt/<pool>/<dataset-keys>
+  ```
 
 ---
 
