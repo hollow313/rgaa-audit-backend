@@ -5,7 +5,7 @@ const crypto = require('node:crypto');
 const app = require('../src/server');
 const db = require('../src/db');
 const config = require('../src/config');
-const { signLicense, initKeypair } = require('../src/crypto');
+const { signLicense, initKeypair, verifyLicenseKey } = require('../src/crypto');
 
 function makeWebhookHeaders(provider, payload, secret, options = {}) {
   const timestamp = options.timestamp !== undefined ? options.timestamp : Math.floor(Date.now() / 1000);
@@ -61,10 +61,18 @@ describe('API Endpoints', () => {
     await new Promise((resolve) => server.close(resolve));
   });
 
-  it('GET / returns HTML dashboard with clean token unlock modal (no basic auth dialog)', async () => {
+  it('GET / rejects unauthenticated request with 401 without WWW-Authenticate header', async () => {
     const res = await fetch(`${baseUrl}/`);
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 401);
     assert.equal(res.headers.get('www-authenticate'), null, 'Must NOT send WWW-Authenticate header to avoid browser user/password dialog');
+    const html = await res.text();
+    assert.ok(html.includes('ADMIN_TOKEN'));
+    assert.ok(!html.includes('admin-login-modal'), 'Must not serve dashboard HTML without authentication');
+  });
+
+  it('GET / with valid token query parameter serves full HTML dashboard with 200', async () => {
+    const res = await fetch(`${baseUrl}/?token=${config.adminToken}`);
+    assert.equal(res.status, 200);
     const html = await res.text();
     assert.ok(html.includes('admin-login-modal'));
     assert.ok(html.includes('login-token-input'));
@@ -654,7 +662,7 @@ describe('API Endpoints', () => {
     assert.equal(updatedLic.status, 'revoked');
   });
 
-  it('P1: POST /v1/webhook/polar subscription.cycled extends license expiration date', async () => {
+  it('P1: POST /v1/webhook/polar subscription.cycled extends license expiration date and re-signs key', async () => {
     const licId = 'lic_cycle_' + Date.now();
     const subId = 'sub_cycle_' + Date.now();
     db.createLicense({
@@ -691,9 +699,108 @@ describe('API Endpoints', () => {
     const body = await res.json();
     assert.equal(body.status, 'license_renewed');
     assert.equal(body.expires, '2028-10-30');
+    assert.ok(body.key, 'Must return new signed key on renewal');
 
+    // Check database
     const updatedLic = db.getLicenseById(licId);
     assert.equal(updatedLic.expires_at, '2028-10-30');
+    assert.equal(updatedLic.signed_key, body.key, 'Stored signed key must match new key');
+
+    // Cryptographic offline verification of the renewed key
+    const verification = verifyLicenseKey(body.key);
+    assert.equal(verification.valid, true);
+    assert.equal(verification.payload.expires, '2028-10-30');
+  });
+
+  it('P1: Webhook retry on error (failed event is retried and not burned by idempotency)', async () => {
+    const eventId = 'evt_retry_test_' + Date.now();
+    const badPayload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        product_id: 'unknown-product-uuid-1234',
+        customer: { email: 'retry-buyer@example.com' },
+        order_id: 'ord_retry_' + Date.now()
+      }
+    };
+
+    const headers = makeWebhookHeaders('polar', badPayload, config.polarWebhookSecret);
+    const res1 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(badPayload)
+    });
+    assert.equal(res1.status, 500);
+
+    // Event should be recorded as 'failed', not burned
+    const evt1 = db.getEvent(eventId);
+    assert.equal(evt1.status, 'failed');
+
+    // Polar retries with corrected data using the SAME eventId
+    const retryPayload = {
+      id: eventId,
+      type: 'order.paid',
+      data: {
+        product_id: 'e6ad51d6-2e68-48b0-abdd-7038c571c6e7', // Valid Solo product
+        customer: { email: 'retry-buyer@example.com' },
+        order_id: 'ord_retry_' + Date.now()
+      }
+    };
+    const retryHeaders = makeWebhookHeaders('polar', retryPayload, config.polarWebhookSecret);
+    const res2 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: retryHeaders,
+      body: JSON.stringify(retryPayload)
+    });
+    assert.equal(res2.status, 200);
+    const b2 = await res2.json();
+    assert.equal(b2.status, 'license_issued');
+
+    // Now event status is 'processed'
+    const evt2 = db.getEvent(eventId);
+    assert.equal(evt2.status, 'processed');
+
+    // Further duplicate replays return already_processed
+    const res3 = await fetch(`${baseUrl}/v1/webhook/polar`, {
+      method: 'POST',
+      headers: retryHeaders,
+      body: JSON.stringify(retryPayload)
+    });
+    assert.equal(res3.status, 200);
+    const b3 = await res3.json();
+    assert.equal(b3.status, 'already_processed');
+  });
+
+  it('P1: POST /v1/activate rate limit allows up to 30 requests/minute for agency multi-site setups', async () => {
+    const licenseId = 'test-agency-limit-' + Date.now();
+    db.createLicense({
+      id: licenseId,
+      email: 'agency@example.com',
+      plan: 'agence',
+      sites: 15,
+      domain: '*',
+      expires_at: '2029-12-31',
+      status: 'active'
+    });
+
+    const signed = signLicense({
+      id: licenseId,
+      license_id: licenseId,
+      plan: 'agence',
+      sites: 15,
+      domain: '*',
+      expires: '2029-12-31'
+    });
+
+    // Fire 15 consecutive activation calls for 15 distinct domains (under 30/min limit)
+    for (let i = 1; i <= 15; i++) {
+      const res = await fetch(`${baseUrl}/v1/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: signed.key, domain: `site-${i}.agency.com` })
+      });
+      assert.equal(res.status, 200, `Call ${i} should succeed without hitting 429`);
+    }
   });
 
   it('P0: POST /v1/webhook/paddle enforces HMAC and accepts valid signature', async () => {

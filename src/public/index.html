@@ -510,8 +510,10 @@
     function setAdminToken(token) {
       if (token) {
         localStorage.setItem('rgaa_admin_token', token.trim());
+        document.cookie = 'rgaa_admin_token=' + encodeURIComponent(token.trim()) + '; path=/; max-age=2592000; SameSite=Strict';
       } else {
         localStorage.removeItem('rgaa_admin_token');
+        document.cookie = 'rgaa_admin_token=; path=/; max-age=0; SameSite=Strict';
       }
     }
 

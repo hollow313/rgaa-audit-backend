@@ -13,7 +13,7 @@ function getTransporter() {
   return transporter;
 }
 
-async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = null }) {
+async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = null, isRenewal = false }) {
   const mailer = getTransporter();
   if (!mailer) {
     console.log(`[mailer] SMTP_URL not configured. Skipping email to ${to.replace(/(?<=.{2}).(?=.*@)/g, '*')}`);
@@ -21,12 +21,14 @@ async function sendLicenseEmail({ to, plan, domain, expires, key, downloadUrl = 
   }
 
   const dlLink = downloadUrl || `https://updates.rgaa-audit.eu/v1/updates/rgaa-audit?key=${encodeURIComponent(key)}`;
-  const subject = 'Votre clé de licence RGAA Audit';
+  const subject = isRenewal ? 'Renouvellement de votre licence RGAA Audit' : 'Votre clé de licence RGAA Audit';
+  const intro = isRenewal
+    ? 'Votre abonnement a été renouvelé avec succès ! Voici votre nouvelle clé de licence mise à jour :'
+    : 'Merci pour votre commande !\n\nVoici votre clé de licence pour RGAA Audit :';
+
   const text = `Bonjour,
 
-Merci pour votre commande !
-
-Voici votre clé de licence pour RGAA Audit :
+${intro}
 ${key}
 
 Détails de la licence :
@@ -51,7 +53,7 @@ L'équipe RGAA Audit
       subject,
       text
     });
-    console.log(`[mailer] License email sent successfully to ${to.replace(/(?<=.{2}).(?=.*@)/g, '*')}`);
+    console.log(`[mailer] ${isRenewal ? 'Renewal' : 'License'} email sent successfully to ${to.replace(/(?<=.{2}).(?=.*@)/g, '*')}`);
     return true;
   } catch (err) {
     console.error(`[mailer] Failed to send email: ${err.message}`);
@@ -59,6 +61,11 @@ L'équipe RGAA Audit
   }
 }
 
+async function sendLicenseRenewalEmail(opts) {
+  return sendLicenseEmail({ ...opts, isRenewal: true });
+}
+
 module.exports = {
-  sendLicenseEmail
+  sendLicenseEmail,
+  sendLicenseRenewalEmail
 };

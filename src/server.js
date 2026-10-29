@@ -70,7 +70,7 @@ function rateLimit(map, key, maxRequests, windowMs) {
   return record.count <= maxRequests;
 }
 
-// Rate limiting middleware for /v1/updates*, /v1/download*, /v1/activate* (U-05)
+// Rate limiting middleware for /v1/updates*, /v1/download* (U-05: 10/min per key)
 function applyRateLimiting(req, res, next) {
   const ip = req.ip || req.socket.remoteAddress;
 
@@ -84,6 +84,28 @@ function applyRateLimiting(req, res, next) {
   const key = req.query.key || (req.body && req.body.key);
   if (key) {
     if (!rateLimit(keyLimits, key, 10, 60 * 1000)) {
+      res.setHeader('Retry-After', '60');
+      return res.status(429).json({ error: 'too_many_requests' });
+    }
+  }
+
+  next();
+}
+
+// Specialized rate limiter for activation/deactivation (30 requests/minute per key, to allow Agency plans)
+function applyActivateRateLimiting(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress;
+
+  // 120 requests/hour per IP for activations
+  if (!rateLimit(ipLimits, `act_${ip}`, 120, 60 * 60 * 1000)) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'too_many_requests' });
+  }
+
+  // 30 requests/minute per key for activations
+  const key = req.query.key || (req.body && req.body.key);
+  if (key) {
+    if (!rateLimit(keyLimits, `act_${key}`, 30, 60 * 1000)) {
       res.setHeader('Retry-After', '60');
       return res.status(429).json({ error: 'too_many_requests' });
     }
@@ -189,7 +211,7 @@ function invalidateCrlCache() {
    Web UI Dashboard API & Admin Security (P0)
 ---------------------------------------------------- */
 
-// Helper to check admin authorization via Bearer header, Basic auth, or ?token= query parameter
+// Helper to check admin authorization via Bearer header, Basic auth, cookie, or ?token= query parameter
 function checkAdminToken(req) {
   const expectedToken = config.adminToken;
   if (!expectedToken) return false;
@@ -205,6 +227,15 @@ function checkAdminToken(req) {
     token = (parts[1] || parts[0] || '').trim();
   } else if (req.query && req.query.token) {
     token = String(req.query.token).trim();
+  } else if (req.headers['cookie']) {
+    const cookies = req.headers['cookie'].split(';');
+    for (const c of cookies) {
+      const [k, v] = c.trim().split('=');
+      if (k === 'rgaa_admin_token' && v) {
+        token = decodeURIComponent(v).trim();
+        break;
+      }
+    }
   }
 
   if (!token) return false;
@@ -233,8 +264,53 @@ function requireAdminToken(req, res, next) {
 
 app.use('/api', applyApiRateLimiting, requireAdminToken);
 
-// Serve index.html on root
+// Serve index.html on root (strictly protected by ADMIN_TOKEN)
 app.get('/', (req, res) => {
+  if (!checkAdminToken(req)) {
+    return res.status(401).type('html').send(`<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Connexion — RGAA Audit Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 400px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 1px solid #334155; }
+    h1 { font-size: 1.25rem; margin-top: 0; margin-bottom: 0.5rem; text-align: center; }
+    p { font-size: 0.875rem; color: #94a3b8; text-align: center; margin-bottom: 1.5rem; }
+    input { width: 100%; box-sizing: border-box; padding: 0.75rem 1rem; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 1rem; margin-bottom: 1rem; outline: none; }
+    input:focus { border-color: #38bdf8; }
+    button { width: 100%; padding: 0.75rem 1rem; border-radius: 8px; border: none; background: #2563eb; color: white; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    button:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>RGAA Audit Admin</h1>
+    <p>Accès restreint. Veuillez saisir votre jeton d'administration.</p>
+    <form onsubmit="event.preventDefault(); const t = document.getElementById('token').value.trim(); if(t) { document.cookie = 'rgaa_admin_token=' + encodeURIComponent(t) + '; path=/; max-age=2592000; SameSite=Strict'; window.location.href = '/?token=' + encodeURIComponent(t); }">
+      <input type="password" id="token" placeholder="ADMIN_TOKEN" autofocus required>
+      <button type="submit">Déverrouiller</button>
+    </form>
+  </div>
+  <script>
+    try {
+      const stored = localStorage.getItem('rgaa_admin_token');
+      if (stored) {
+        document.cookie = 'rgaa_admin_token=' + encodeURIComponent(stored) + '; path=/; max-age=2592000; SameSite=Strict';
+        window.location.href = '/?token=' + encodeURIComponent(stored);
+      }
+    } catch (e) {}
+  </script>
+</body>
+</html>`);
+  }
+
+  // When authenticated, if token was passed via query, set cookie for convenience
+  if (req.query && req.query.token) {
+    res.setHeader('Set-Cookie', `rgaa_admin_token=${encodeURIComponent(req.query.token)}; Path=/; Max-Age=2592000; SameSite=Strict; HttpOnly`);
+  }
+
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
     return res.sendFile(indexPath);
@@ -409,8 +485,8 @@ app.get('/v1/public-key', (req, res) => {
   }
 });
 
-// Activation (with U-05 rate limiting)
-app.post('/v1/activate', applyRateLimiting, (req, res) => {
+// Activation (with rate limiting: 30/min per key)
+app.post('/v1/activate', applyActivateRateLimiting, (req, res) => {
   const { key, domain, plugin_version } = req.body || {};
   if (!key || !domain) {
     return res.status(400).json({ error: 'bad_request', message: 'Missing key or domain' });
@@ -497,8 +573,8 @@ app.post('/v1/activate', applyRateLimiting, (req, res) => {
   });
 });
 
-// Deactivation (P1: frees an activation slot, with U-05 rate limiting)
-app.post('/v1/deactivate', applyRateLimiting, (req, res) => {
+// Deactivation (P1: frees an activation slot, with rate limiting: 30/min per key)
+app.post('/v1/deactivate', applyActivateRateLimiting, (req, res) => {
   const { key, domain } = req.body || {};
   if (!key || !domain) {
     return res.status(400).json({ error: 'bad_request', message: 'Missing key or domain' });
@@ -787,9 +863,9 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
     return res.status(400).json({ error: 'invalid_webhook_payload' });
   }
 
-  // Idempotency check (§3, §4, U-01)
-  const isNew = db.recordEvent(eventId, eventType);
-  if (!isNew) {
+  // Idempotency check with status tracking (§P1)
+  const eventRecord = db.recordEventStart(eventId, eventType);
+  if (!eventRecord.shouldProcess) {
     return res.status(200).json({ status: 'already_processed' });
   }
 
@@ -802,6 +878,7 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       const ref = data.subscription_id || data.id;
       const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
       if (!lic) {
+        db.markEventProcessed(eventId);
         return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
       }
       let newExpires = null;
@@ -814,14 +891,41 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         d.setFullYear(d.getFullYear() + 1);
         newExpires = d.toISOString().split('T')[0];
       }
-      db.updateLicenseExpires(lic.id, newExpires);
-      return res.status(200).json({ status: 'license_renewed', id: lic.id, expires: newExpires });
+
+      // Re-sign license key with new expiration date (§P1)
+      const nowIso = new Date().toISOString();
+      const payload = {
+        id: lic.id,
+        plan: lic.plan,
+        sites: lic.sites,
+        expires: newExpires,
+        domain: lic.domain,
+        issued_at: nowIso
+      };
+      const signed = signLicense(payload);
+
+      // Store updated expiration date and signed_key
+      db.updateLicenseExpires(lic.id, newExpires, signed.key);
+
+      // Send renewal email to client
+      sendLicenseEmail({
+        to: lic.email,
+        plan: lic.plan,
+        domain: lic.domain,
+        expires: newExpires,
+        key: signed.key,
+        isRenewal: true
+      }).catch(err => console.error(`[webhook] Renewal mail error: ${err.message}`));
+
+      db.markEventProcessed(eventId);
+      return res.status(200).json({ status: 'license_renewed', id: lic.id, key: signed.key, expires: newExpires });
     }
 
     // 2. Initial purchase: subscription.created or order.paid
     if (eventType === 'subscription.created' || eventType === 'order.paid') {
       const email = data?.customer?.email || data?.customer_email || data?.email || '';
       if (!email) {
+        db.markEventFailed(eventId, 'missing_customer_email');
         return res.status(422).json({ error: 'missing_customer_email' });
       }
 
@@ -831,6 +935,7 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         if (data?.plan) {
           mapped = { plan: data.plan, sites: data.sites || 1 };
         } else {
+          db.markEventFailed(eventId, `unknown_product: ${productId}`);
           return res.status(500).json({ error: 'unknown_product', product_id: productId });
         }
       }
@@ -890,6 +995,7 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         key: signed.key
       }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
 
+      db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
     }
 
@@ -898,9 +1004,11 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       const ref = data?.subscription_id || data?.id;
       const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
       if (!lic) {
+        db.markEventProcessed(eventId);
         return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
       }
       db.setAutoRenew(lic.id, 0);
+      db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'auto_renew_disabled' });
     }
 
@@ -909,15 +1017,19 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       const ref = data?.subscription_id || data?.order_id || data?.id;
       const lic = ref ? db.getLicenseByProviderRef('polar', ref) : null;
       if (!lic) {
+        db.markEventProcessed(eventId);
         return res.status(200).json({ status: 'ignored', reason: 'no_license_for_ref' });
       }
       db.updateLicenseStatus(lic.id, 'revoked', eventType);
       invalidateCrlCache();
+      db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'license_revoked' });
     }
 
+    db.markEventProcessed(eventId);
     res.status(200).json({ status: 'ignored' });
   } catch (err) {
+    db.markEventFailed(eventId, err.message);
     console.error(`[webhook] Polar handler error: ${err.message}`);
     res.status(500).json({ error: 'internal_error' });
   }
@@ -933,8 +1045,8 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
     return res.status(400).json({ error: 'invalid_webhook_payload' });
   }
 
-  const isNew = db.recordEvent(eventId, eventType);
-  if (!isNew) {
+  const eventRecord = db.recordEventStart(eventId, eventType);
+  if (!eventRecord.shouldProcess) {
     return res.status(200).json({ status: 'already_processed' });
   }
 
@@ -985,6 +1097,7 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
         key: signed.key
       }).catch(err => console.error(`[webhook] Mail error: ${err.message}`));
 
+      db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'license_issued', id: licenseId, key: signed.key });
     }
 
@@ -998,11 +1111,14 @@ app.post('/v1/webhook/paddle', requireWebhookHmac('paddle'), async (req, res) =>
           invalidateCrlCache();
         }
       }
+      db.markEventProcessed(eventId);
       return res.status(200).json({ status: 'license_revoked' });
     }
 
+    db.markEventProcessed(eventId);
     res.status(200).json({ status: 'ignored' });
   } catch (err) {
+    db.markEventFailed(eventId, err.message);
     console.error(`[webhook] Paddle handler error: ${err.message}`);
     res.status(500).json({ error: 'internal_error' });
   }

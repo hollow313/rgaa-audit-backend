@@ -70,9 +70,13 @@ function initSchema(db) {
     );
 
     CREATE TABLE IF NOT EXISTS events (                          -- idempotence des webhooks
-      id          TEXT PRIMARY KEY,                -- id d'événement du MoR
-      type        TEXT NOT NULL,
-      received_at TEXT NOT NULL
+      id           TEXT PRIMARY KEY,                             -- id d'événement du MoR
+      type         TEXT NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'received',             -- 'received', 'processed', 'failed'
+      attempts     INTEGER NOT NULL DEFAULT 1,
+      last_error   TEXT,
+      received_at  TEXT NOT NULL,
+      processed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS releases (
@@ -94,6 +98,18 @@ function initSchema(db) {
   } catch {}
   try {
     db.exec('ALTER TABLE licenses ADD COLUMN auto_renew INTEGER NOT NULL DEFAULT 1;');
+  } catch {}
+  try {
+    db.exec("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'received';");
+  } catch {}
+  try {
+    db.exec("ALTER TABLE events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;");
+  } catch {}
+  try {
+    db.exec("ALTER TABLE events ADD COLUMN last_error TEXT;");
+  } catch {}
+  try {
+    db.exec("ALTER TABLE events ADD COLUMN processed_at TEXT;");
   } catch {}
 
   // Revoke security-test licenses if present (§P0)
@@ -140,10 +156,15 @@ function setAutoRenew(id, autoRenew = 0, customDb = null) {
   return getLicenseById(id, db);
 }
 
-function updateLicenseExpires(id, newExpires, customDb = null) {
+function updateLicenseExpires(id, newExpires, newSignedKey = null, customDb = null) {
   const db = customDb || getDb();
-  const stmt = db.prepare('UPDATE licenses SET expires_at = ? WHERE id = ?');
-  stmt.run(newExpires, id);
+  if (newSignedKey) {
+    const stmt = db.prepare('UPDATE licenses SET expires_at = ?, signed_key = ? WHERE id = ?');
+    stmt.run(newExpires, newSignedKey, id);
+  } else {
+    const stmt = db.prepare('UPDATE licenses SET expires_at = ? WHERE id = ?');
+    stmt.run(newExpires, id);
+  }
   return getLicenseById(id, db);
 }
 
@@ -250,16 +271,64 @@ function getSharedLicenses(customDb = null) {
   return stmt.all();
 }
 
-function recordEvent(id, type, customDb = null) {
+function recordEventStart(id, type, customDb = null) {
   const db = customDb || getDb();
   const now = new Date().toISOString();
-  try {
-    const stmt = db.prepare('INSERT INTO events (id, type, received_at) VALUES (?, ?, ?)');
-    stmt.run(id, type, now);
-    return true; // Successfully recorded new event
-  } catch {
-    return false; // Already exists (idempotency triggered)
+
+  const checkStmt = db.prepare('SELECT id, status, attempts FROM events WHERE id = ?');
+  const existing = checkStmt.get(id);
+
+  if (!existing) {
+    const insertStmt = db.prepare(
+      "INSERT INTO events (id, type, status, attempts, received_at) VALUES (?, ?, 'received', 1, ?)"
+    );
+    insertStmt.run(id, type, now);
+    return { shouldProcess: true, isRetry: false, attempts: 1 };
   }
+
+  // Already processed successfully: do not re-process
+  if (existing.status === 'processed') {
+    return { shouldProcess: false, status: 'already_processed', attempts: existing.attempts };
+  }
+
+  // If status is 'received' (retry while processing) or 'failed': allow retry
+  const nextAttempts = (existing.attempts || 1) + 1;
+  const updateStmt = db.prepare(
+    "UPDATE events SET attempts = ?, type = ?, received_at = ? WHERE id = ?"
+  );
+  updateStmt.run(nextAttempts, type, now, id);
+  return { shouldProcess: true, isRetry: true, attempts: nextAttempts };
+}
+
+function markEventProcessed(id, customDb = null) {
+  const db = customDb || getDb();
+  const now = new Date().toISOString();
+  const stmt = db.prepare(
+    "UPDATE events SET status = 'processed', processed_at = ?, last_error = NULL WHERE id = ?"
+  );
+  stmt.run(now, id);
+}
+
+function markEventFailed(id, errorMessage, customDb = null) {
+  const db = customDb || getDb();
+  const stmt = db.prepare(
+    "UPDATE events SET status = 'failed', last_error = ? WHERE id = ?"
+  );
+  stmt.run(errorMessage ? String(errorMessage).slice(0, 500) : 'unknown_error', id);
+}
+
+function getEvent(id, customDb = null) {
+  const db = customDb || getDb();
+  return db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+}
+
+function recordEvent(id, type, customDb = null) {
+  const res = recordEventStart(id, type, customDb);
+  if (res.shouldProcess) {
+    markEventProcessed(id, customDb);
+    return true;
+  }
+  return false;
 }
 
 function getRevokedLicenses(customDb = null) {
@@ -350,6 +419,10 @@ module.exports = {
   deleteActivation,
   getSharedLicenses,
   recordEvent,
+  recordEventStart,
+  markEventProcessed,
+  markEventFailed,
+  getEvent,
   purgeOldEvents,
   revokeSecurityTestLicenses,
   getRevokedLicenses,
