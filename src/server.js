@@ -343,8 +343,8 @@ app.get('/v1/crl', (req, res) => {
 });
 
 // Plugin updates manifest (§1.3 & §4)
-app.get('/v1/updates/:slug', (req, res) => {
-  const { slug } = req.params;
+app.get(['/v1/updates', '/v1/updates/:slug'], (req, res) => {
+  const slug = req.params.slug || 'rgaa-audit';
   const key = req.query.key;
 
   // If key is supplied, verify it
