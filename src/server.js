@@ -1223,7 +1223,7 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
       }
       const { plan, sites } = mapped;
 
-      // Extract client domain from Polar custom fields (M-05)
+      // Extract client domain from Polar custom fields (M-05 & M-06)
       let rawDomain = '';
       if (data?.custom_field_data && typeof data.custom_field_data === 'object') {
         rawDomain = data.custom_field_data.domain || '';
@@ -1236,10 +1236,16 @@ app.post('/v1/webhook/polar', requireWebhookHmac('polar'), async (req, res) => {
         rawDomain = data.domain;
       }
 
-      const domain = rawDomain ? normalizeDomain(rawDomain) : '';
+      const sitesCount = sites || 1;
+      const declared = normalizeDomain(rawDomain || '');
 
-      // Section 4.2: Refuser une commande Polar sans domaine exploitable (422, pas 500)
-      if (!domain || domain === '*') {
+      // Un pack multi-sites ne peut pas être lié à un domaine unique : il se consomme
+      // sur les sites du client au fil de l'année. La limite est le quota `sites`,
+      // appliqué par /v1/activate, plus la détection de partage du dashboard.
+      const domain = sitesCount > 1 ? '*' : declared;
+
+      // Pour Solo, le domaine est obligatoire et ne peut pas être '*'
+      if (!domain || (sitesCount === 1 && domain === '*')) {
         db.markEventFailed(eventId, 'missing_domain');
         return res.status(422).json({ error: 'missing_domain' });
       }
