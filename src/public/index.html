@@ -673,6 +673,12 @@
         showLoginModal('Session expirée ou jeton ADMIN_TOKEN invalide (401).');
         throw new Error('Accès non autorisé (401)');
       }
+      if (res.status === 429) {
+        const body = await res.json().catch(() => ({}));
+        const wait = res.headers.get('Retry-After') || body.retry_after || '60';
+        showToast(`⏳ Trop de requêtes — réessayez dans ${wait} s.`);
+        throw new Error(body.message || `Trop de requêtes (429) — réessayez dans ${wait} s.`);
+      }
       return res;
     }
 
@@ -696,9 +702,17 @@
           fetchWithAuth('/api/releases').catch(() => null)
         ]);
 
-        allLicenses = await licRes.json();
+        const licData = await licRes.json();
         const stats = await statsRes.json();
         const shared = await sharedRes.json();
+
+        // Never feed an error payload to the renderers: a 429/500 body is an
+        // object, not a list, and rendering it empties the tables.
+        const licenses = Array.isArray(licData) ? licData : (Array.isArray(licData.licenses) ? licData.licenses : null);
+        if (!licenses || !Array.isArray(shared)) {
+          throw new Error('Réponse inattendue du serveur — données précédentes conservées.');
+        }
+        allLicenses = licenses;
 
         // Update stats
         document.getElementById('stat-active').textContent = stats.active || 0;
@@ -716,10 +730,11 @@
 
         if (relRes && relRes.ok) {
           const relData = await relRes.json();
-          renderReleases(relData.releases || []);
+          renderReleases(Array.isArray(relData.releases) ? relData.releases : []);
         }
       } catch (err) {
         console.error('Error loading data:', err);
+        showToast(`⚠️ ${err.message}`);
       }
     }
 

@@ -1112,12 +1112,25 @@ describe('API Endpoints', () => {
     assert.equal(retryAfterHeader, '60');
   });
 
-  it('P0: Rate limiting on /api/* rejects more than 10 requests per minute with 429', async () => {
+  it('P0: /api/* reads have their own budget — a dashboard refresh is never throttled', async () => {
+    // One dashboard refresh costs 4 GETs and every action triggers another one.
+    // Reads: 240/min per IP, so a normal admin session never sees a 429.
+    for (let i = 0; i < 30; i++) {
+      const res = await fetch(`${baseUrl}/api/stats`, {
+        headers: { 'Authorization': 'Bearer bad_token_attempt' }
+      });
+      assert.notEqual(res.status, 429, `Read ${i + 1} must not be throttled`);
+    }
+    app.resetRateLimits();
+  });
+
+  it('P0: /api/* writes are still capped at 60 requests per minute with 429', async () => {
     let got429 = false;
     let retryAfterHeader = null;
 
-    for (let i = 0; i < 11; i++) {
-      const res = await fetch(`${baseUrl}/api/stats`, {
+    for (let i = 0; i < 61; i++) {
+      const res = await fetch(`${baseUrl}/api/licenses/unknown-id`, {
+        method: 'DELETE',
         headers: { 'Authorization': 'Bearer bad_token_attempt' }
       });
       if (res.status === 429) {
@@ -1127,7 +1140,7 @@ describe('API Endpoints', () => {
       }
     }
 
-    assert.equal(got429, true, 'The 11th request to /api/* must receive HTTP 429');
+    assert.equal(got429, true, 'The 61st write to /api/* must receive HTTP 429');
     assert.equal(retryAfterHeader, '60');
     app.resetRateLimits();
   });

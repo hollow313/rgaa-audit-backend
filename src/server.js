@@ -264,12 +264,31 @@ function checkAdminToken(req) {
   return tokenBuf.length === expectedBuf.length && crypto.timingSafeEqual(tokenBuf, expectedBuf);
 }
 
-// Rate limiting middleware for /api/* (10 requests/minute per IP)
+// Rate limiting middleware for /api/*.
+//
+// The dashboard is a single-page app: one data refresh costs 4 GETs, and every
+// action triggers another refresh. A single shared budget (formerly 10/min for
+// everything) was exhausted by two deletions, after which every read returned
+// 429 and the tables rendered empty. Reads and writes now have separate
+// budgets, sized so normal admin use never hits the ceiling while a runaway
+// client still does.
+const API_READ_LIMIT = 240; // GET per IP per minute
+const API_WRITE_LIMIT = 60; // mutating requests per IP per minute
+
 function applyApiRateLimiting(req, res, next) {
   const ip = req.ip || req.socket.remoteAddress;
-  if (!rateLimit(apiLimits, ip, 10, 60 * 1000)) {
-    res.setHeader('Retry-After', '60');
-    return res.status(429).json({ error: 'too_many_requests' });
+  const isRead = req.method === 'GET' || req.method === 'HEAD';
+  const bucket = isRead ? `read:${ip}` : `write:${ip}`;
+  const max = isRead ? API_READ_LIMIT : API_WRITE_LIMIT;
+
+  if (!rateLimit(apiLimits, bucket, max, 60 * 1000)) {
+    const retryAfter = isRead ? 60 : 60;
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({
+      error: 'too_many_requests',
+      message: `Trop de requêtes (${isRead ? 'lecture' : 'écriture'}) — réessayez dans ${retryAfter} s.`,
+      retry_after: retryAfter
+    });
   }
   next();
 }
