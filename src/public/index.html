@@ -345,6 +345,23 @@
       </div>
     </div>
 
+    <!-- Détail des commandes en échec (webhooks signés non traités) -->
+    <div class="card" id="failed-events-card" style="display: none;">
+      <div class="card-title">
+        <span>⚠️ Commandes en échec — détail</span>
+      </div>
+      <p style="margin: 0 0 .9rem; color: #94a3b8; font-size: .86rem;">
+        Événements de paiement signés que le serveur n'a pas pu traiter. « Tentatives » = nombre de renvois du prestataire.
+        Un événement de test porte une date de recette et une erreur de configuration ; une vente réelle vient de Polar.
+      </p>
+      <table>
+        <thead>
+          <tr><th>Reçu le</th><th>Type</th><th>Tentatives</th><th>Erreur</th></tr>
+        </thead>
+        <tbody id="failed-events-tbody"></tbody>
+      </table>
+    </div>
+
     <!-- Formulaire d'émission -->
     <div class="card">
       <div class="card-title">
@@ -727,6 +744,15 @@
 
         renderLicenses(allLicenses);
         renderShared(shared);
+
+        if ((stats.events_failed || 0) > 0) {
+          fetchWithAuth('/api/events?status=failed&limit=20')
+            .then((r) => (r.ok ? r.json() : { events: [] }))
+            .then((d) => renderFailedEvents(d.events))
+            .catch(() => renderFailedEvents([]));
+        } else {
+          renderFailedEvents([]);
+        }
 
         if (relRes && relRes.ok) {
           const relData = await relRes.json();
@@ -1161,6 +1187,28 @@
       toast.textContent = msg;
       toast.style.display = 'block';
       setTimeout(() => { toast.style.display = 'none'; }, 2500);
+    }
+
+    function renderFailedEvents(events) {
+      const card = document.getElementById('failed-events-card');
+      const tbody = document.getElementById('failed-events-tbody');
+      if (!card || !tbody) return;
+
+      if (!Array.isArray(events) || events.length === 0) {
+        card.style.display = 'none';
+        return;
+      }
+
+      tbody.innerHTML = events.map((ev) => {
+        const when = ev.received_at ? new Date(ev.received_at).toLocaleString('fr-FR') : '-';
+        return `<tr>
+          <td>${escapeHtml(when)}</td>
+          <td><code>${escapeHtml(ev.type || '')}</code></td>
+          <td>${Number(ev.attempts) || 1}</td>
+          <td>${escapeHtml(ev.last_error || '')}</td>
+        </tr>`;
+      }).join('');
+      card.style.display = 'block';
     }
 
     function renderReleases(releases) {

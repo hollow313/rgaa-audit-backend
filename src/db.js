@@ -405,6 +405,27 @@ function markEventFailed(id, errorMessage, customDb = null) {
   stmt.run(errorMessage ? String(errorMessage).slice(0, 500) : 'unknown_error', id);
 }
 
+/**
+ * Lists webhook events, newest first.
+ *
+ * @param {string|null} status Filter on status ('received'|'processed'|'failed')
+ * @param {number} limit Maximum rows (capped at 200)
+ * @param {object|null} customDb Optional DB handle (tests)
+ * @returns {object[]} Rows
+ */
+function listEvents(status = null, limit = 50, customDb = null) {
+  const db = customDb || getDb();
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+
+  if (status) {
+    return db
+      .prepare('SELECT * FROM events WHERE status = ? ORDER BY received_at DESC LIMIT ?')
+      .all(status, capped);
+  }
+
+  return db.prepare('SELECT * FROM events ORDER BY received_at DESC LIMIT ?').all(capped);
+}
+
 function getEvent(id, customDb = null) {
   const db = customDb || getDb();
   return db.prepare('SELECT * FROM events WHERE id = ?').get(id);
@@ -534,6 +555,7 @@ module.exports = {
   markEventProcessed,
   markEventFailed,
   getEvent,
+  listEvents,
   purgeOldEvents,
   revokeSecurityTestLicenses,
   getRevokedLicenses,

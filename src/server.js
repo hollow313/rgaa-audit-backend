@@ -358,6 +358,19 @@ app.get('/', (req, res) => {
 });
 
 // Stats for dashboard
+// Webhook events (payment orders) — the dashboard only showed a count, with no
+// way to tell a failing real sale from a leftover test event.
+app.get('/api/events', (req, res) => {
+  try {
+    const allowed = ['received', 'processed', 'failed'];
+    const status = allowed.includes(req.query.status) ? req.query.status : null;
+    const limit = parseInt(req.query.limit, 10) || 50;
+    res.json({ events: db.listEvents(status, limit) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/stats', (req, res) => {
   try {
     const stats = db.getLicenseStats();

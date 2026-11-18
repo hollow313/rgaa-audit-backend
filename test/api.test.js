@@ -163,6 +163,27 @@ describe('API Endpoints', () => {
     assert.ok(typeof stats.active === 'number');
   });
 
+  it('Web UI API: GET /api/events lists failed webhook events with their error', async () => {
+    db.recordEventStart('evt_failed_for_dashboard_test', 'order.paid');
+    db.markEventFailed('evt_failed_for_dashboard_test', 'unknown_product');
+
+    const res = await fetch(`${baseUrl}/api/events?status=failed&limit=10`, {
+      headers: { 'Authorization': `Bearer ${config.adminToken}` }
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(Array.isArray(data.events));
+    const found = data.events.find((e) => e.id === 'evt_failed_for_dashboard_test');
+    assert.ok(found, 'the failed event must be listed');
+    assert.equal(found.last_error, 'unknown_product');
+    assert.equal(found.status, 'failed');
+  });
+
+  it('Web UI API: GET /api/events requires the admin token', async () => {
+    const res = await fetch(`${baseUrl}/api/events?status=failed`);
+    assert.equal(res.status, 401);
+  });
+
   it('GET /healthz returns ok, db status and mail: true when configured', async () => {
     const res = await fetch(`${baseUrl}/healthz`);
     assert.equal(res.status, 200);
